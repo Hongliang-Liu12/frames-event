@@ -84,21 +84,21 @@ if __name__ == "__main__":
     #   此时模型的主干被冻结了，特征提取网络不发生改变
     #   占用的显存较小，仅对网络进行微调
     #----------------------------------------------------#
-    Init_Epoch          = 0
+    Init_Epoch  = 0
 
     #----------------------------------------------------#
     #   解冻阶段训练参数
     #   此时模型的主干不被冻结了，特征提取网络会发生改变
     #   占用的显存较大，网络所有的参数都会发生改变
     #----------------------------------------------------#
-    End_Epoch      = 30
-    batch_size = 8
-    lr         = 1e-4
+    End_Epoch   = 30
+    batch_size  = 8
+    lr          = 0.01 / 64.0 * batch_size
     #------------------------------------------------------#
     #   是否进行冻结训练，默认先冻结主干训练后解冻训练。
 
     #------------------------------------------------------#
-    num_workers         = 8
+    num_workers = 8
 
     #----------------------------------------------------#
     #   获取classes
@@ -129,11 +129,14 @@ if __name__ == "__main__":
     yolo_loss    = YOLOLoss(num_classes)
     loss_history = LossHistory("logs/")
 
-     
+
+    #===========================================================
+    #开始训练
     start_epoch = 0
-    end_epoch   = 10
-                    
-    optimizer       = optim.Adam(model_train.parameters(), lr, weight_decay = 5e-4)
+    end_epoch   = 60
+    
+    optimizer = optim.SGD(model_train.parameters(), lr=lr, weight_decay=5e-4)
+    # optimizer       = optim.Adam(model_train.parameters(), lr, weight_decay = 5e-4)
     if Cosine_scheduler:
         lr_scheduler = optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=end_epoch, eta_min=1e-5)
     else:
