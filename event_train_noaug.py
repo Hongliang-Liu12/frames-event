@@ -91,9 +91,9 @@ if __name__ == "__main__":
     #   此时模型的主干不被冻结了，特征提取网络会发生改变
     #   占用的显存较大，网络所有的参数都会发生改变
     #----------------------------------------------------#
-    End_Epoch   = 30
+    End_Epoch   = 100
     batch_size  = 8
-    lr          = 0.01 / 64.0 * batch_size
+    lr          = 0.01 / 64.0 * 16
     #------------------------------------------------------#
     #   是否进行冻结训练，默认先冻结主干训练后解冻训练。
 
@@ -133,7 +133,7 @@ if __name__ == "__main__":
     #===========================================================
     #开始训练
     start_epoch = 0
-    end_epoch   = 60
+    end_epoch   = 100
     warmup_epochs=5
     optimizer = optim.SGD(model_train.parameters(), lr=lr, momentum=0.9, weight_decay=5e-4)
     # optimizer       = optim.Adam(model_train.parameters(), lr, weight_decay = 5e-4)
