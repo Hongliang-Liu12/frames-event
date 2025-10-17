@@ -134,8 +134,8 @@ if __name__ == "__main__":
     #开始训练
     start_epoch = 0
     end_epoch   = 60
-    
-    optimizer = optim.SGD(model_train.parameters(), lr=lr, weight_decay=5e-4)
+    warmup_epochs=5
+    optimizer = optim.SGD(model_train.parameters(), lr=lr, momentum=0.9, weight_decay=5e-4)
     # optimizer       = optim.Adam(model_train.parameters(), lr, weight_decay = 5e-4)
     if Cosine_scheduler:
         lr_scheduler = optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=end_epoch, eta_min=1e-5)
@@ -149,27 +149,17 @@ if __name__ == "__main__":
         input_shape=input_shape,
         num_classes=num_classes
     )
-    val_dataset     = EventJsonDataset(
-        json_path=val_json_path,
-        image_root=image_root,
-        input_shape=input_shape,
-        num_classes=num_classes
-    )
+
     
     gen         = DataLoader(train_dataset, shuffle = True, batch_size = batch_size, num_workers = num_workers, pin_memory=True,
                                 drop_last=True, collate_fn=yolo_dataset_collate)
-    gen_val     = DataLoader(val_dataset  , shuffle = True, batch_size = batch_size, num_workers = num_workers, pin_memory=True, 
-                                drop_last=True, collate_fn=yolo_dataset_collate)
+
     
     num_train = len(train_dataset)
-    num_val   = len(val_dataset)
     epoch_step      = num_train // batch_size
-    epoch_step_val  = num_val // batch_size
-    
-    if epoch_step == 0 or epoch_step_val == 0:
-        raise ValueError("数据集过小，无法进行训练，请扩充数据集。")
+
         
     for epoch in range(start_epoch, end_epoch):
-        fit_one_epoch(model_train, model, yolo_loss, loss_history, optimizer, epoch, 
-                epoch_step, epoch_step_val, gen, gen_val, end_epoch, Cuda)
+        fit_one_epoch(model_train, model, yolo_loss, optimizer, epoch, 
+                epoch_step, gen, end_epoch, Cuda,warmup_epochs=warmup_epochs)
         lr_scheduler.step()
