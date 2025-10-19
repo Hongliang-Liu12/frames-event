@@ -247,67 +247,106 @@ class YOLOLoss(nn.Module):
         area_i = torch.prod(br - tl, 2) * en
         return area_i / (area_a[:, None] + area_b - area_i)
 
-    def get_in_boxes_info(self, gt_bboxes_per_image, expanded_strides, x_shifts, y_shifts, total_num_anchors, num_gt, center_radius = 2.5):
-        #-------------------------------------------------------#
-        #   expanded_strides_per_image  [n_anchors_all]
-        #   x_centers_per_image         [num_gt, n_anchors_all]
-        #   x_centers_per_image         [num_gt, n_anchors_all]
-        #-------------------------------------------------------#
+    # def get_in_boxes_info(self, gt_bboxes_per_image, expanded_strides, x_shifts, y_shifts, total_num_anchors, num_gt, center_radius = 2.5):
+    #     #-------------------------------------------------------#
+    #     #   expanded_strides_per_image  [n_anchors_all]
+    #     #   x_centers_per_image         [num_gt, n_anchors_all]
+    #     #   x_centers_per_image         [num_gt, n_anchors_all]
+    #     #-------------------------------------------------------#
+    #     expanded_strides_per_image  = expanded_strides[0]
+    #     x_centers_per_image         = ((x_shifts[0] + 0.5) * expanded_strides_per_image).unsqueeze(0).repeat(num_gt, 1)
+    #     y_centers_per_image         = ((y_shifts[0] + 0.5) * expanded_strides_per_image).unsqueeze(0).repeat(num_gt, 1)
+
+    #     #-------------------------------------------------------#
+    #     #   gt_bboxes_per_image_x       [num_gt, n_anchors_all]
+    #     #-------------------------------------------------------#
+    #     gt_bboxes_per_image_l = (gt_bboxes_per_image[:, 0] - 0.5 * gt_bboxes_per_image[:, 2]).unsqueeze(1).repeat(1, total_num_anchors)
+    #     gt_bboxes_per_image_r = (gt_bboxes_per_image[:, 0] + 0.5 * gt_bboxes_per_image[:, 2]).unsqueeze(1).repeat(1, total_num_anchors)
+    #     gt_bboxes_per_image_t = (gt_bboxes_per_image[:, 1] - 0.5 * gt_bboxes_per_image[:, 3]).unsqueeze(1).repeat(1, total_num_anchors)
+    #     gt_bboxes_per_image_b = (gt_bboxes_per_image[:, 1] + 0.5 * gt_bboxes_per_image[:, 3]).unsqueeze(1).repeat(1, total_num_anchors)
+
+    #     #-------------------------------------------------------#
+    #     #   bbox_deltas     [num_gt, n_anchors_all, 4]
+    #     #-------------------------------------------------------#
+    #     b_l = x_centers_per_image - gt_bboxes_per_image_l
+    #     b_r = gt_bboxes_per_image_r - x_centers_per_image
+    #     b_t = y_centers_per_image - gt_bboxes_per_image_t
+    #     b_b = gt_bboxes_per_image_b - y_centers_per_image
+    #     bbox_deltas = torch.stack([b_l, b_t, b_r, b_b], 2)
+
+    #     #-------------------------------------------------------#
+    #     #   is_in_boxes     [num_gt, n_anchors_all]
+    #     #   is_in_boxes_all [n_anchors_all]
+    #     #-------------------------------------------------------#
+    #     is_in_boxes     = bbox_deltas.min(dim=-1).values > 0.0
+    #     is_in_boxes_all = is_in_boxes.sum(dim=0) > 0
+
+    #     gt_bboxes_per_image_l = (gt_bboxes_per_image[:, 0]).unsqueeze(1).repeat(1, total_num_anchors) - center_radius * expanded_strides_per_image.unsqueeze(0)
+    #     gt_bboxes_per_image_r = (gt_bboxes_per_image[:, 0]).unsqueeze(1).repeat(1, total_num_anchors) + center_radius * expanded_strides_per_image.unsqueeze(0)
+    #     gt_bboxes_per_image_t = (gt_bboxes_per_image[:, 1]).unsqueeze(1).repeat(1, total_num_anchors) - center_radius * expanded_strides_per_image.unsqueeze(0)
+    #     gt_bboxes_per_image_b = (gt_bboxes_per_image[:, 1]).unsqueeze(1).repeat(1, total_num_anchors) + center_radius * expanded_strides_per_image.unsqueeze(0)
+
+    #     #-------------------------------------------------------#
+    #     #   center_deltas   [num_gt, n_anchors_all, 4]
+    #     #-------------------------------------------------------#
+    #     c_l = x_centers_per_image - gt_bboxes_per_image_l
+    #     c_r = gt_bboxes_per_image_r - x_centers_per_image
+    #     c_t = y_centers_per_image - gt_bboxes_per_image_t
+    #     c_b = gt_bboxes_per_image_b - y_centers_per_image
+    #     center_deltas       = torch.stack([c_l, c_t, c_r, c_b], 2)
+
+    #     #-------------------------------------------------------#
+    #     #   is_in_centers       [num_gt, n_anchors_all]
+    #     #   is_in_centers_all   [n_anchors_all]
+    #     #-------------------------------------------------------#
+    #     is_in_centers       = center_deltas.min(dim=-1).values > 0.0
+    #     is_in_centers_all   = is_in_centers.sum(dim=0) > 0
+
+    #     #-------------------------------------------------------#
+    #     #   is_in_boxes_anchor      [n_anchors_all]
+    #     #   is_in_boxes_and_center  [num_gt, is_in_boxes_anchor]
+    #     #-------------------------------------------------------#
+    #     is_in_boxes_anchor      = is_in_boxes_all | is_in_centers_all
+    #     is_in_boxes_and_center  = is_in_boxes[:, is_in_boxes_anchor] & is_in_centers[:, is_in_boxes_anchor]
+    #     return is_in_boxes_anchor, is_in_boxes_and_center
+
+    def get_in_boxes_info(self, gt_bboxes_per_image, expanded_strides, x_shifts, y_shifts, total_num_anchors, num_gt):
+        """
+        这是一个更严格的候选框筛选策略，与官方YOLOX的实现对齐。
+        它只选择那些中心点在真实框中心3x3邻域内的锚点作为候选。
+        """
+        # 将中心半径从2.5调整为1.5，创建一个更小的3x3邻域
+        center_radius = 1.5
+        
+        # 获取每个锚点的中心坐标
         expanded_strides_per_image  = expanded_strides[0]
-        x_centers_per_image         = ((x_shifts[0] + 0.5) * expanded_strides_per_image).unsqueeze(0).repeat(num_gt, 1)
-        y_centers_per_image         = ((y_shifts[0] + 0.5) * expanded_strides_per_image).unsqueeze(0).repeat(num_gt, 1)
+        x_centers_per_image = ((x_shifts[0] + 0.5) * expanded_strides_per_image).unsqueeze(0).repeat(num_gt, 1)
+        y_centers_per_image = ((y_shifts[0] + 0.5) * expanded_strides_per_image).unsqueeze(0).repeat(num_gt, 1)
 
-        #-------------------------------------------------------#
-        #   gt_bboxes_per_image_x       [num_gt, n_anchors_all]
-        #-------------------------------------------------------#
-        gt_bboxes_per_image_l = (gt_bboxes_per_image[:, 0] - 0.5 * gt_bboxes_per_image[:, 2]).unsqueeze(1).repeat(1, total_num_anchors)
-        gt_bboxes_per_image_r = (gt_bboxes_per_image[:, 0] + 0.5 * gt_bboxes_per_image[:, 2]).unsqueeze(1).repeat(1, total_num_anchors)
-        gt_bboxes_per_image_t = (gt_bboxes_per_image[:, 1] - 0.5 * gt_bboxes_per_image[:, 3]).unsqueeze(1).repeat(1, total_num_anchors)
-        gt_bboxes_per_image_b = (gt_bboxes_per_image[:, 1] + 0.5 * gt_bboxes_per_image[:, 3]).unsqueeze(1).repeat(1, total_num_anchors)
+        # 计算真实框中心的3x3邻域边界
+        # gt_bboxes_per_image[:, 0] 是真实框的中心x坐标
+        # gt_bboxes_per_image[:, 1] 是真实框的中心y坐标
+        center_dist = expanded_strides_per_image.unsqueeze(0) * center_radius
+        gt_bboxes_per_image_l = (gt_bboxes_per_image[:, 0:1]) - center_dist
+        gt_bboxes_per_image_r = (gt_bboxes_per_image[:, 0:1]) + center_dist
+        gt_bboxes_per_image_t = (gt_bboxes_per_image[:, 1:2]) - center_dist
+        gt_bboxes_per_image_b = (gt_bboxes_per_image[:, 1:2]) + center_dist
 
-        #-------------------------------------------------------#
-        #   bbox_deltas     [num_gt, n_anchors_all, 4]
-        #-------------------------------------------------------#
-        b_l = x_centers_per_image - gt_bboxes_per_image_l
-        b_r = gt_bboxes_per_image_r - x_centers_per_image
-        b_t = y_centers_per_image - gt_bboxes_per_image_t
-        b_b = gt_bboxes_per_image_b - y_centers_per_image
-        bbox_deltas = torch.stack([b_l, b_t, b_r, b_b], 2)
-
-        #-------------------------------------------------------#
-        #   is_in_boxes     [num_gt, n_anchors_all]
-        #   is_in_boxes_all [n_anchors_all]
-        #-------------------------------------------------------#
-        is_in_boxes     = bbox_deltas.min(dim=-1).values > 0.0
-        is_in_boxes_all = is_in_boxes.sum(dim=0) > 0
-
-        gt_bboxes_per_image_l = (gt_bboxes_per_image[:, 0]).unsqueeze(1).repeat(1, total_num_anchors) - center_radius * expanded_strides_per_image.unsqueeze(0)
-        gt_bboxes_per_image_r = (gt_bboxes_per_image[:, 0]).unsqueeze(1).repeat(1, total_num_anchors) + center_radius * expanded_strides_per_image.unsqueeze(0)
-        gt_bboxes_per_image_t = (gt_bboxes_per_image[:, 1]).unsqueeze(1).repeat(1, total_num_anchors) - center_radius * expanded_strides_per_image.unsqueeze(0)
-        gt_bboxes_per_image_b = (gt_bboxes_per_image[:, 1]).unsqueeze(1).repeat(1, total_num_anchors) + center_radius * expanded_strides_per_image.unsqueeze(0)
-
-        #-------------------------------------------------------#
-        #   center_deltas   [num_gt, n_anchors_all, 4]
-        #-------------------------------------------------------#
+        # 判断每个锚点的中心是否落在这个3x3邻域内
         c_l = x_centers_per_image - gt_bboxes_per_image_l
         c_r = gt_bboxes_per_image_r - x_centers_per_image
         c_t = y_centers_per_image - gt_bboxes_per_image_t
         c_b = gt_bboxes_per_image_b - y_centers_per_image
-        center_deltas       = torch.stack([c_l, c_t, c_r, c_b], 2)
+        center_deltas = torch.stack([c_l, c_t, c_r, c_b], 2)
+        is_in_centers = center_deltas.min(dim=-1).values > 0.0
 
-        #-------------------------------------------------------#
-        #   is_in_centers       [num_gt, n_anchors_all]
-        #   is_in_centers_all   [n_anchors_all]
-        #-------------------------------------------------------#
-        is_in_centers       = center_deltas.min(dim=-1).values > 0.0
-        is_in_centers_all   = is_in_centers.sum(dim=0) > 0
-
-        #-------------------------------------------------------#
-        #   is_in_boxes_anchor      [n_anchors_all]
-        #   is_in_boxes_and_center  [num_gt, is_in_boxes_anchor]
-        #-------------------------------------------------------#
-        is_in_boxes_anchor      = is_in_boxes_all | is_in_centers_all
-        is_in_boxes_and_center  = is_in_boxes[:, is_in_boxes_anchor] & is_in_centers[:, is_in_boxes_anchor]
+        # 关键修改：只使用is_in_centers作为唯一的筛选条件
+        # 移除了原来宽松的 "is_in_boxes_all | is_in_centers_all" 逻辑
+        is_in_boxes_anchor = is_in_centers.sum(dim=0) > 0
+        
+        # is_in_boxes_and_center现在就是is_in_centers
+        is_in_boxes_and_center = is_in_centers[:, is_in_boxes_anchor]
+        
         return is_in_boxes_anchor, is_in_boxes_and_center
 
     def dynamic_k_matching(self, cost, pair_wise_ious, gt_classes, num_gt, fg_mask):
