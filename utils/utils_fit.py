@@ -2,23 +2,8 @@ import torch
 from tqdm import tqdm
 
 from utils.utils import get_lr
-from eval import get_coco_map
-from eval import Evdet200kCocoDataset, letterbox_collate_fn
-from torch.utils.data import DataLoader
 
-
-
-# 1. 创建验证数据集和 COCO Ground Truth 对象
-DATASET_ROOT_DIR = "/home/lhl/Git/datasets/EvDET200K"
-BATCH_SIZE = 16
-
-# 真实值创建方式
-val_dataset = Evdet200kCocoDataset(DATASET_ROOT_DIR, split="test")
-val_dataloader = DataLoader(val_dataset, batch_size=BATCH_SIZE, shuffle=False, num_workers=4, pin_memory=True, collate_fn=letterbox_collate_fn)
-coco_gt = val_dataset.coco # <--- 这就是我们需要的真实 coco_gt 对象        
-
-
-
+   
 
 def fit_one_epoch(model_train, model, yolo_loss, optimizer, epoch, epoch_step, gen, Epoch, cuda,warmup_epochs=0):
     loss        = 0
@@ -86,39 +71,7 @@ def fit_one_epoch(model_train, model, yolo_loss, optimizer, epoch, epoch_step, g
 
     print('Finish Train')
 
-    model_train.eval()
-    print('Start Validation')
-# --- 验证与 COCO 评估阶段 (这是核心改动) ---
-    print('Start Validation')
-    # 确定用于评估的模型，优先使用 EMA
-    model_to_eval =model_train.eval()
-    
-    # 获取设备信息
-    device = 'cuda' if cuda else 'cpu'
-    
-    # 调用评估函数
-    coco_evaluator = get_coco_map(
-            model=model_to_eval,
-            dataloader=val_dataloader,
-            coco_gt=coco_gt, # <--- 使用从主脚本传入的真实 coco_gt
-            device=device,
-            # 你可以根据需要调整这里的参数
-            confidence=0.01,
-            nms_iou=0.65 
-        )
-    # 提取并打印 mAP 结果
-    val_map = 0.0
-    if coco_evaluator:
-        print("\n" + "="*35 + " COCO EVALUATION SUMMARY " + "="*35)
-        coco_evaluator.summarize()
-        # 提取关键指标: AP @[ IoU=0.50:0.95 | area=all | maxDets=100 ]
-        val_map = coco_evaluator.stats[0] 
-        print(f"\nReturned mAP @[IoU=0.50:0.95]: {val_map:.4f}")
-    
-    print('Finish Validation')
-
-    print('Finish Validation')
 
     print('Epoch:'+ str(epoch+1) + '/' + str(Epoch))
     print('Total Loss: %.3f' % (loss / epoch_step))
-    torch.save(model.state_dict(), 'logs/ep%03d-loss%.3f.pth' % (epoch + 1, loss / epoch_step))
+    torch.save(model.state_dict(), 'log_frames/ep%03d-loss%.3f.pth' % (epoch + 1, loss / epoch_step))
