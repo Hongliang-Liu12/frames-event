@@ -60,7 +60,7 @@ if __name__ == "__main__":
     train_json_path = '/home/lhl/Git/datasets/EvDET200K/Event_Frame/annotations/train.json'
     val_json_path   = '/home/lhl/Git/datasets/EvDET200K/Event_Frame/annotations/test.json'
     image_root      = '/home/lhl/Git/datasets/EvDET200K/Event_Frame/data'  # 图像根目录
-
+    yolox_pretrained_path = '/home/lhl/Git/YOLOX-main/YOLOX_outputs/evdet200k100/yolox_base/epoch_30_ckpt.pth'
     model_path      = ''
     #------------------------------------------------------#
     #   输入的shape大小，一定要是32的倍数
@@ -92,6 +92,74 @@ if __name__ == "__main__":
     model = YoloBodySST(num_classes,num_frame=3)
 
     weights_init(model)
+
+    # --- 智能加载YOLOX预训练权重 ---
+    if yolox_pretrained_path != '':
+        print(f'Loading pretrained YOLOX weights from "{yolox_pretrained_path}"')
+        device          = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+        # 加载预训练的YOLOX模型权重
+        pretrained_state_dict = torch.load(yolox_pretrained_path, map_location=device)
+
+        device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+        pretrained_state_dict = torch.load(yolox_pretrained_path, map_location=device)
+
+        # --- DEBUG 1: 检查文件结构 ---
+        print("--- Pretrained File Keys ---")
+        print(pretrained_state_dict.keys())
+        print("----------------------------")
+
+        # 如果你看到 'model' 或 'state_dict' 这样的键，说明它是一个 checkpoint
+        # 你需要取出真正的 state_dict，例如：
+        if 'model' in pretrained_state_dict:
+            pretrained_state_dict = pretrained_state_dict['model']
+        elif 'state_dict' in pretrained_state_dict:
+            pretrained_state_dict = pretrained_state_dict['state_dict']
+        # -----------------------------
+        model_state_dict = model.state_dict()
+
+        # --- DEBUG 2: 对比键名和形状 ---
+        model_keys = set(model_state_dict.keys())
+        pretrained_keys = set(pretrained_state_dict.keys())
+
+        common_keys = model_keys & pretrained_keys
+        print(f"Found {len(common_keys)} common keys.")
+
+        # 打印出那些键名相同但形状不同的层
+        shape_mismatch_keys = []
+        for k in common_keys:
+            if model_state_dict[k].shape != pretrained_state_dict[k].shape:
+                shape_mismatch_keys.append(k)
+                print(f"Shape Mismatch for key: {k}")
+                print(f"  > Model shape: {model_state_dict[k].shape}")
+                print(f"  > Pretrained shape: {pretrained_state_dict[k].shape}")
+
+        # 打印出那些只存在于一方的键（帮助你发现键名差异）
+        print("\nKeys in pretrained but not in new model (first 5):")
+        print(list(pretrained_keys - model_keys)[:5])
+        print("\nKeys in new model but not in pretrained (first 5):")
+        print(list(model_keys - pretrained_keys)[:5])
+        # -----------------------------------
+
+        # 你的原始代码
+        load_dict = {k: v for k, v in pretrained_state_dict.items() if k in model_state_dict and model_state_dict[k].shape == v.shape}
+        model_state_dict = model.state_dict()       
+        # 获取当前新模型的state_dict
+        model_state_dict = model.state_dict()
+        
+        # 筛选出那些在新模型中也存在、且形状一致的层
+        # 这会自动匹配 backbone.* 和 head.* 的权重，并忽略新的 neck.* 模块
+        load_dict = {k: v for k, v in pretrained_state_dict.items() if k in model_state_dict and model_state_dict[k].shape == v.shape}
+        
+        # 用加载的权重更新当前模型的 state_dict
+        model_state_dict.update(load_dict)
+        model.load_state_dict(model_state_dict)
+        
+        print(f'Success! Loaded {len(load_dict)} matching layers from the YOLOX pretrained model.')
+        print("The new temporal neck layers will be trained from scratch.")
+
+
+
+
     if model_path != '':
         print('Load weights {}.'.format(model_path))
         device          = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
@@ -161,11 +229,7 @@ if __name__ == "__main__":
 
         
     for epoch in range(start_epoch, end_epoch):
-        fit_one_epoch(model_train, model, yolo_loss, optimizer, epoch, 
-                epoch_step, gen, end_epoch, Cuda,warmup_epochs=warmup_epochs)
-        if epoch >= warmup_epochs:
-            lr_scheduler.step()
-         
+
         if epoch % 2 == 0 :
             print('Start Validation')
     
@@ -199,5 +263,13 @@ if __name__ == "__main__":
                print(f"\nReturned mAP @[IoU=0.50:0.95]: {val_map:.4f}")
             
             print('Finish Validation')
+
+
+        fit_one_epoch(model_train, model, yolo_loss, optimizer, epoch, 
+                epoch_step, gen, end_epoch, Cuda,warmup_epochs=warmup_epochs)
+        if epoch >= warmup_epochs:
+            lr_scheduler.step()
+         
+
 
             
