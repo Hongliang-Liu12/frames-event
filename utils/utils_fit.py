@@ -5,7 +5,7 @@ from utils.utils import get_lr
 
    
 
-def fit_one_epoch(model_train, model, yolo_loss, optimizer, epoch, epoch_step, gen, Epoch, cuda,warmup_epochs=0):
+def fit_one_epoch(model_train, model, yolo_loss, optimizer, epoch, epoch_step, gen, Epoch, cuda,ema_model=None,warmup_epochs=0,lr_scheduler=None,Cosine_scheduler=False):
     loss        = 0
     if epoch < warmup_epochs:
         # 在 Warmup 期间，我们需要一个固定的目标 LR 来计算线性增长。
@@ -62,16 +62,36 @@ def fit_one_epoch(model_train, model, yolo_loss, optimizer, epoch, epoch_step, g
             #----------------------#
             loss_value.backward()
             optimizer.step()
+            # --- [NEW] 更新 EMA ---
+            if ema_model:
+                ema_model.update(model_train)
+            if Cosine_scheduler and epoch >= warmup_epochs:
+                lr_scheduler.step()
 
+            # if iteration %1000 == 0:
+            #     print('lr : %.6f' % get_lr(optimizer))
             loss += loss_value.item()
             
             pbar.set_postfix(**{'loss'  : loss / (iteration + 1), 
                                 'lr'    : get_lr(optimizer)})
             pbar.update(1)
-
+            
+        if not Cosine_scheduler and epoch >= warmup_epochs:
+            lr_scheduler.step()
+            print("step lr_scheduler")
     print('Finish Train')
 
 
     print('Epoch:'+ str(epoch+1) + '/' + str(Epoch))
     print('Total Loss: %.3f' % (loss / epoch_step))
-    torch.save(model.state_dict(), 'log_frames/ep%03d-loss%.3f.pth' % (epoch + 1, loss / epoch_step))
+
+    
+# # --- [MODIFIED] 保存 EMA 模型的权重 ---
+#     # 这样保存的 .pth 文件才是用于评估和推理的
+#     if ema_model:
+#         save_model_state = ema_model.ema.state_dict()
+#         print("Saving EMA model state...")
+#     else:
+#         save_model_state = model.state_dict()
+#         print("Saving raw model state (EMA not enabled)...")
+#     torch.save(save_model_state, 'logs/brandnewfrom0/ep%03d-loss%.3f.pth' % (epoch + 1, loss / epoch_step))

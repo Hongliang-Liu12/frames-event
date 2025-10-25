@@ -7,6 +7,7 @@ Medical_Datasets/
 logs/
 inference_results/
 img/
+log_frames/
 # Byte-compiled / optimized / DLL files
 __pycache__/
 *.py[cod]

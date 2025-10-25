@@ -8,7 +8,10 @@ from nets.yolo_training import YOLOLoss, weights_init
 from torch.utils.data import DataLoader
 from torchvision.datasets import CocoDetection
 from tqdm import tqdm
+# ↓↓↓ 你需要从这里导入你的 *新* 模型 ↓↓↓
+# 假设你的新模型仍然叫 YoloBody 并且在 nets.yolo 中
 from nets.yolo_frames_net import YoloBodySST
+# from nets.yolo_seq import YoloBody # 或者你新模型的实际路径
 from pycocotools.coco import COCO
 from pycocotools.cocoeval import COCOeval
 
@@ -50,149 +53,174 @@ CLASS_NAMES = [
     "basketball", "ping_pong", "goose", "cat", "bird", "UAV"
 ]
 
+# ================================================================ #
+#                  ↓↓↓ MODIFIED DATASET ↓↓↓
+# ================================================================ #
 class Evdet200kCocoDataset(CocoDetection):
-    def __init__(self, root_dir, split="test", seq_len=3):
+    def __init__(self, root_dir, split="test", seq_len=3): # <--- MODIFIED: 添加 seq_len
         annotation_path = os.path.join(root_dir, "Event_Frame", "annotations", f"{split}.json")
         images_root = os.path.join(root_dir, "Event_Frame", "data")
         super().__init__(root=images_root, annFile=annotation_path)
         
-        # --- FIX: Store a reference to the original, complete COCO API object
-        self.original_coco_loader = self.coco
-
-        self.seq_len = seq_len
+        self.seq_len = seq_len # <--- MODIFIED
         
+        # --- MODIFIED: 借用新 EventJsonDataset 中的序列构建逻辑 ---
         print(f"Building sequences for {split} set (seq_len={self.seq_len})...")
         groups = {}
-        # Use the original loader to get all image IDs
-        for img_id in self.original_coco_loader.getImgIds():
-            img_info = self.original_coco_loader.loadImgs(img_id)[0]
+        # 1. 按文件夹分组
+        for img_id in self.ids:
+            img_info = self.coco.loadImgs(img_id)[0]
             file_name = img_info.get('file_name', '')
             folder = os.path.dirname(file_name)
             groups.setdefault(folder, []).append((img_id, file_name))
 
         id_to_sequence = {}
+        # 2. 对每个组排序并创建滑动窗口
         for folder, items in groups.items():
             try:
+                # 按文件名中的数字排序
                 items_sorted = sorted(items, key=lambda x: int(os.path.splitext(os.path.basename(x[1]))[0]))
             except Exception:
+                # 如果失败，则按字典序排序
                 items_sorted = sorted(items, key=lambda x: x[1])
             
             ids_sorted = [it[0] for it in items_sorted]
             
+            # 3. 创建映射：target_id -> [id_t-N+1, ..., id_t]
             for i in range(self.seq_len - 1, len(ids_sorted)):
-                target_id = ids_sorted[i]
+                target_id = ids_sorted[i] # 目标帧是窗口的最后一帧
                 seq_ids = ids_sorted[i - self.seq_len + 1 : i + 1]
                 id_to_sequence[target_id] = seq_ids
 
         self.id_to_sequence = id_to_sequence
         
-        original_id_count = len(self.original_coco_loader.getImgIds())
-        # self.ids will become the list of valid TARGET frame IDs
-        self.ids = [img_id for img_id in self.original_coco_loader.getImgIds() if img_id in self.id_to_sequence]
+        # 4. 过滤 self.ids，只保留那些作为有效序列结尾的图像ID
+        original_id_count = len(self.ids)
+        self.ids = [img_id for img_id in self.ids if img_id in self.id_to_sequence]
         print(f"Filtered {original_id_count} -> {len(self.ids)} valid target frames.")
-        
-        # <--- 新增开始: 创建一个只包含有效目标帧的 coco_gt 对象 ---
-        print("Creating a filtered COCO ground truth object for evaluation...")
-        
-        # 1. 创建一个新的、空的 COCO 对象
-        filtered_coco = COCO()
-        
-        # 2. 填充筛选后的图像信息
-        # Use the original loader to get data for the filtered IDs
-        filtered_coco.dataset['images'] = self.original_coco_loader.loadImgs(self.ids)
-        
-        # 3. 获取并填充与这些图像相关的标注信息
-        ann_ids = self.original_coco_loader.getAnnIds(imgIds=self.ids)
-        filtered_coco.dataset['annotations'] = self.original_coco_loader.loadAnns(ann_ids)
-        
-        # 4. 复制类别信息
-        filtered_coco.dataset['categories'] = self.original_coco_loader.loadCats(self.original_coco_loader.getCatIds())
-        
-        # 5. 为新的 coco 对象创建索引，这对于评估至关重要
-        filtered_coco.createIndex()
-        
-        # 6. 用这个新的、经过筛选的 coco 对象替换掉原来的
-        # This is now the filtered GT object for evaluation
-        self.coco = filtered_coco
-        print("Filtered COCO ground truth object created successfully.")
-        # <--- 新增结束 ---
+        # --- END MODIFIED ---
 
     def __getitem__(self, index):
-        # This is the target frame ID, which exists in the filtered self.coco
-        img_id = self.ids[index]
+        # <--- MODIFIED: 加载整个序列，但目标只针对最后一帧 ---
+        
+        # 1. 获取目标帧 (最后一帧) 的 ID 和信息
+        img_id = self.ids[index] # 这是目标帧 (t) 的 ID
         target = self.coco.loadAnns(self.coco.getAnnIds(imgIds=[img_id]))
         target_img_info = self.coco.loadImgs(img_id)[0]
         
-        # This sequence contains IDs that may NOT be in the filtered self.coco
+        # 2. 获取这个目标帧对应的完整序列 ID [t-N+1, ..., t]
         seq_ids = self.id_to_sequence[img_id]
+        
         image_seq_np = []
         
+        # 3. 加载序列中的每一帧
         for frame_id in seq_ids:
-            # --- FIX: Use the saved original loader to get info for ALL frames in the sequence
-            frame_info = self.original_coco_loader.loadImgs(frame_id)[0]
+            frame_info = self.coco.loadImgs(frame_id)[0]
             image_path = os.path.join(self.root, frame_info['file_name'])
             image_np = cv2.imread(image_path)
             
+            # 处理可能丢失的图像
             if image_np is None:
                 print(f"Warning: Could not read image {image_path}. Using black frame.")
                 h = target_img_info.get('height', 640)
                 w = target_img_info.get('width', 640)
                 image_np = np.zeros((h, w, 3), dtype=np.uint8)
+                
             image_seq_np.append(image_np)
 
+        # 返回：
+        # 1. 图像序列 (list of np.array)
+        # 2. 目标帧的标注
+        # 3. 目标帧的图像信息
         return image_seq_np, target, target_img_info
+        # --- END MODIFIED ---
 
+# ================================================================ #
+#                  ↓↓↓ MODIFIED COLLATE_FN ↓↓↓
+# ================================================================ #
 def letterbox_collate_fn(batch):
+    # batch 是一个列表, 每一项是 (image_seq_np, target, target_img_info)
     images_seqs, targets, img_infos = zip(*batch)
-    processed_seqs, ratios = [], []
-    input_size = (640, 640)
     
+    processed_seqs = []
+    ratios = [] # <--- MODIFIED: 我们只关心目标帧(最后一帧)的ratio
+    input_size = (640, 640) # 假设输入尺寸
+    
+    # 遍历批次中的每个序列
     for seq in images_seqs:
         processed_frames = []
+        
+        # 遍历序列中的每一帧
         for i, img in enumerate(seq):
             img_h, img_w = img.shape[:2]
             scale = min(input_size[0] / img_h, input_size[1] / img_w)
             
+            # <--- MODIFIED: 只保存最后一帧 (目标帧) 的缩放比例
             if i == len(seq) - 1:
                 ratios.append(scale)
-            
+                
             new_w, new_h = int(img_w * scale), int(img_h * scale)
             resized_img = cv2.resize(img, (new_w, new_h), interpolation=cv2.INTER_LINEAR)
             
             padded_img = np.full((input_size[0], input_size[1], 3), 114, dtype=np.uint8)
             padded_img[0:new_h, 0:new_w] = resized_img
-            padded_img = padded_img.transpose((2, 0, 1))
+            
+            padded_img = padded_img.transpose((2, 0, 1)) # HWC -> CHW
             padded_img = np.ascontiguousarray(padded_img, dtype=np.float32)
             processed_frames.append(padded_img)
+            
+        # 将处理后的帧堆叠成 (N, C, H, W)
         processed_seqs.append(np.stack(processed_frames, axis=0))
 
+    # 将所有序列堆叠成 (BS, N, C, H, W)
     images_batch = torch.from_numpy(np.stack(processed_seqs, axis=0))
+    
+    # 返回 (BS, N, C, H, W) 的图像，以及 *只对应目标帧* 的 targets, img_infos, ratios
     return images_batch, list(targets), list(img_infos), ratios
+    # --- END MODIFIED ---
 
 def print_per_class_results(coco_eval, class_names):
     # ... (此函数保持不变)
     eval_results = coco_eval.eval
     precisions = eval_results['precision']
-    # recall is not directly available per class in the same way
+    recalls = eval_results['recall']
     cat_ids = coco_eval.cocoGt.getCatIds()
     id_to_name = {cat['id']: cat['name'] for cat in coco_eval.cocoGt.loadCats(cat_ids)}
     
     results_data = []
-    print("\n" + "="*50)
-    print(f"{'CLASS':<20} | {'AP @[.5:.95]':^20}")
-    print("-" * 50)
     for k_idx, cat_id in enumerate(cat_ids):
-        # areaRng = 'all', maxDets = 100
         p = precisions[:, :, k_idx, 0, 2]
         p = p[p > -1]
         ap = np.mean(p) * 100.0 if p.size > 0 else float('nan')
-        results_data.append((id_to_name.get(cat_id, "unknown"), ap))
-        ap_str = f"{ap:.3f}" if not np.isnan(ap) else "---"
-        print(f"{id_to_name.get(cat_id, 'unknown'):<20} | {ap_str:^20}")
-    print("=" * 50)
+        r = recalls[:, k_idx, 0, 2]
+        r = r[r > -1]
+        ar = np.mean(r) * 100.0 if r.size > 0 else float('nan')
+        results_data.append((id_to_name.get(cat_id, "unknown"), ap, ar))
 
+    print("\n" + "="*70)
+    print(f"{'CLASS':<20} | {'AP @[.5:.95]':^20} | {'AR @[100]':^20}")
+    print("-" * 70)
+    for name, ap, ar in results_data:
+        ap_str = f"{ap:.3f}" if not np.isnan(ap) else "---"
+        ar_str = f"{ar:.3f}" if not np.isnan(ar) else "---"
+        print(f"{name:<20} | {ap_str:^20} | {ar_str:^20}")
+    print("=" * 70)
+
+
+# ================================================================ #
+#                  ↓↓↓ EVALUATION FUNCTION (UNMODIFIED) ↓↓↓
+# ================================================================ #
 def get_coco_map(model, dataloader, coco_gt, device, confidence=0.01, nms_iou=0.65):
+    """
+    此函数 *无需修改*。
+    
+    - 它接收的 'images' 已经是 (BS, N, C, H, W) 形状，并将其送入模型。
+    - 它接收的 'img_infos' 和 'ratios' 已经与目标帧(最后一帧)对应。
+    - 模型的 'outputs' 格式不变。
+    - 后续的解码、NMS 和坐标反算逻辑因此保持完全兼容。
+    """
     model.eval()
+    
     num_classes = len(CLASS_NAMES)
     input_shape = (640, 640)
     results = []
@@ -200,10 +228,13 @@ def get_coco_map(model, dataloader, coco_gt, device, confidence=0.01, nms_iou=0.
     hw = [(int(input_shape[0] / s), int(input_shape[1] / s)) for s in strides]
     
     print("Starting evaluation...")
+    # <--- 注意: 这里的 'images' 将是 (BS, N, C, H, W) 形状
     for images, _, img_infos, ratios in tqdm(dataloader, desc="Evaluating"):
         images = images.to(device)
         with torch.no_grad():
-            outputs = model(images)
+            outputs = model(images) # <--- 模型现在接收 (BS, N, C, H, W)
+            
+            # --- 后面的所有逻辑保持不变 ---
             outputs = torch.cat([x.flatten(start_dim=2) for x in outputs], dim=2).permute(0, 2, 1)
             outputs[:, :, 4:] = torch.sigmoid(outputs[:, :, 4:])
             grids, strides_tensor_list = [], []
@@ -217,6 +248,7 @@ def get_coco_map(model, dataloader, coco_gt, device, confidence=0.01, nms_iou=0.
             decoded_outputs = torch.cat([(outputs[..., 0:2] + grids) * strides_tensor, torch.exp(outputs[..., 2:4]) * strides_tensor, outputs[..., 4:]], dim=-1)
             final_outputs = postprocess(decoded_outputs, num_classes, confidence, nms_iou)
 
+        # 格式化结果 (完全不变)
         for batch_idx, output_per_image in enumerate(final_outputs):
             if output_per_image is not None:
                 final_outputs_cpu = output_per_image.cpu().numpy()
@@ -224,6 +256,7 @@ def get_coco_map(model, dataloader, coco_gt, device, confidence=0.01, nms_iou=0.
                 top_conf = final_outputs_cpu[:, 4] * final_outputs_cpu[:, 5]
                 top_boxes = final_outputs_cpu[:, :4]
                 
+                # 'ratio' 和 'img_info' 已经正确对应到这一帧
                 ratio = ratios[batch_idx]
                 h, w = img_infos[batch_idx]['height'], img_infos[batch_idx]['width']
                 
@@ -243,13 +276,6 @@ def get_coco_map(model, dataloader, coco_gt, device, confidence=0.01, nms_iou=0.
                         "score": score
                     })
 
-    # 验证ID匹配情况（现在应该匹配了）
-    gt_img_ids = set(coco_gt.getImgIds())
-    dt_img_ids = set([res["image_id"] for res in results]) if results else set()
-    print(f"\nGround Truth image IDs: {len(gt_img_ids)}")
-    print(f"Detection image IDs: {len(dt_img_ids)}")
-    print(f"IDs in GT but not in DT: {len(gt_img_ids - dt_img_ids)}") # 应该为0或非常小
-
     if not results:
         print("No detections were made. Cannot evaluate.")
         return None
@@ -261,69 +287,53 @@ def get_coco_map(model, dataloader, coco_gt, device, confidence=0.01, nms_iou=0.
     
     return coco_eval
 
+# ================================================================ #
+#                  ↓↓↓ STANDALONE EXECUTION EXAMPLE ↓↓↓
+# ================================================================ #
 if __name__ == "__main__":
+    # --- 配置 ---
     DATASET_ROOT_DIR = "/home/lhl/Git/datasets/EvDET200K"
-    MODEL_PATH = "/home/lhl/Git/frames-event/logs/twostage/startmap0.505-0.793/ep013-map50_95-0.5042.pth"
+    MODEL_PATH = "/home/lhl/Git/frames-event/log_frames/ep003-loss7.086.pth"
     BATCH_SIZE = 4
     CONFIDENCE = 0.01
     NMS_IOU = 0.65
     CUDA = True
-    SEQ_LEN = 3
+    SEQ_LEN = 3 # <--- MODIFIED: 定义序列长度
 
+    # --- 1. Setup device and dataset ---
     device = torch.device('cuda' if CUDA and torch.cuda.is_available() else 'cpu')
     print("Loading dataset...")
+    # <--- MODIFIED: 使用修改后的 Dataset，并传入 seq_len
     val_dataset = Evdet200kCocoDataset(DATASET_ROOT_DIR, split="test", seq_len=SEQ_LEN)
+    
+    # <--- MODIFIED: 使用修改后的 collate_fn
     val_dataloader = DataLoader(val_dataset, batch_size=BATCH_SIZE, shuffle=False, num_workers=4, pin_memory=True, collate_fn=letterbox_collate_fn)
-    coco_gt = val_dataset.coco
+    coco_gt = val_dataset.coco # 这仍然有效，因为我们继承自 CocoDetection
 
-# -------------------- [ 从这里开始替换 ] --------------------
+    # --- 2. Load the model ---
     print(f"Loading model from {MODEL_PATH}...")
     checkpoint = torch.load(MODEL_PATH, map_location=device)
+    model_state_dict = checkpoint['model'] if isinstance(checkpoint, dict) and 'model' in checkpoint else checkpoint
     
-    model = YoloBodySST(num_classes=len(CLASS_NAMES), phi='s', num_frame=SEQ_LEN) # 确保phi参数与训练时一致
-
-    # 1. (可选, 但推荐) 检查权重是否被包裹
-    if 'model' in checkpoint:
-        checkpoint = checkpoint['model']
-        print("   Checkpoint file detected. Extracted 'model' state_dict.")
-    elif 'state_dict' in checkpoint:
-        checkpoint = checkpoint['state_dict']
-        print("   Checkpoint file detected. Extracted 'state_dict'.")
-
-    # 2. 获取新模型的 state_dict
-    model_state_dict = model.state_dict()
+    # ↓↓↓ ================== 关键修改 ================== ↓↓↓
+    # 你必须在这里实例化你 *新* 的多序列模型。
+    # YoloBody 必须是能够接受 (BS, N, C, H, W) 输入的新模型类。
+    # 
+    # 例如:
+    # from nets.yolo_multi_frame_model import YoloBodyMultiFrame
+    # model = YoloBodyMultiFrame(num_classes=len(CLASS_NAMES), phi=PHI)
+    # 
+    # (这里我暂时保留 YoloBody，你需要确保它指向正确的类)
+    model = YoloBodySST(num_classes=len(CLASS_NAMES), num_frame=SEQ_LEN)
+    # ↑↑↑ ================== 关键修改 ================== ↑↑↑
     
-    # 3. 过滤 checkpoint，只保留匹配的键
-    #    这就是能自动过滤掉 "total_ops" 的关键
-    load_dict = {
-        k: v for k, v in checkpoint.items()
-        if k in model_state_dict and model_state_dict[k].shape == v.shape
-    }
-    
-    # 4. 打印加载信息
-    model_keys = set(model_state_dict.keys())
-    loaded_keys = set(load_dict.keys())
-    unloaded_keys = model_keys - loaded_keys
-    
-    print(f"   {len(loaded_keys)} out of {len(model_keys)} layers were successfully matched for loading.")
-    if unloaded_keys:
-        print(f"   Warning: {len(unloaded_keys)} keys in the model were NOT found in the checkpoint:")
-        for key in sorted(list(unloaded_keys))[:5]:
-             print(f"     - {key}")
-        if len(unloaded_keys) > 5: print("     - ... (and more)")
-
-    # 5. 更新并加载过滤后的 state_dict
-    model_state_dict.update(load_dict)
-    model.load_state_dict(model_state_dict)
-    
+    # weights_init(model) # 通常在评估时不需要
+    model.load_state_dict(checkpoint) # <--- MODIFIED: 确保加载的是 'model_state_dict'
     model = model.to(device)
     print("Model loaded.")
-    # -------------------- [ 到这里结束替换 ] --------------------
-    print("Model loaded.")
-    print("--- 训练后的融合门 (Fusion Gate) ---")
-    print(f"P3 Gate: {model.fusion_gate_p3.item()}")
-    print(f"P4 Gate: {model.fusion_gate_p4.item()}")
-    print(f"P5 Gate: {model.fusion_gate_p5.item()}")
+
+    # --- 3. Call the evaluation function ---
+    # (此部分无需修改)
     coco_evaluator = get_coco_map(
         model=model,
         dataloader=val_dataloader,
@@ -333,10 +343,12 @@ if __name__ == "__main__":
         nms_iou=NMS_IOU
     )
 
+    # --- 4. Print the results from the returned object ---
+    # (此部分无需修改)
     if coco_evaluator:
         print("\n" + "="*35 + " COCO EVALUATION SUMMARY " + "="*35)
         coco_evaluator.summarize()
         print_per_class_results(coco_evaluator, CLASS_NAMES)
+        
         map_50_95 = coco_evaluator.stats[0]
         print(f"\nReturned mAP @[IoU=0.50:0.95]: {map_50_95:.4f}")
-

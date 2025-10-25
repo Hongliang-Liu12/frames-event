@@ -1,0 +1,292 @@
+#-------------------------------------#
+#       对数据集进行训练
+#-------------------------------------#
+import numpy as np
+import torch
+import torch.backends.cudnn as cudnn
+import torch.optim as optim
+from torch.utils.data import DataLoader
+
+from nets.yolo_frames_net import YoloBodySST
+from nets.yolo_training import YOLOLoss, weights_init
+from utils.callbacks import LossHistory
+
+# 确保这里的导入路径与你的项目结构一致
+from utils.frames_noaug_dataloader import EventJsonDataset,yolo_dataset_collate
+from utils.utils_fit import fit_one_epoch
+from utils.ema import ModelEMA
+from frames_eval import (
+    get_coco_map, 
+    Evdet200kCocoDataset, 
+    letterbox_collate_fn,
+    print_per_class_results
+)
+
+CLASS_NAMES = [
+    "people", "car", "bicycle", "electric bicycle", 
+    "basketball", "ping_pong", "goose", "cat", "bird", "UAV"
+]
+
+
+'''
+训练自己的目标检测模型一定需要注意以下几点：
+1、训练前仔细检查自己的格式是否满足要求，该库要求数据集格式为VOC格式，需要准备好的内容有输入图片和标签
+   输入图片为.jpg图片，无需固定大小，传入训练前会自动进行resize。
+   灰度图会自动转成RGB图片进行训练，无需自己修改。
+   输入图片如果后缀非jpg，需要自己批量转成jpg后再开始训练。
+
+   标签为.xml格式，文件中会有需要检测的目标信息，标签文件和输入图片文件相对应。
+
+2、训练好的权值文件保存在logs文件夹中，每个epoch都会保存一次，如果只是训练了几个step是不会保存的，epoch和step的概念要捋清楚一下。
+   在训练过程中，该代码并没有设定只保存最低损失的，因此按默认参数训练完会有100个权值，如果空间不够可以自行删除。
+   这个并不是保存越少越好也不是保存越多越好，有人想要都保存、有人想只保存一点，为了满足大多数的需求，还是都保存可选择性高。
+
+3、损失值的大小用于判断是否收敛，比较重要的是有收敛的趋势，即验证集损失不断下降，如果验证集损失基本上不改变的话，模型基本上就收敛了。
+   损失值的具体大小并没有什么意义，大和小只在于损失的计算方式，并不是接近于0才好。如果想要让损失好看点，可以直接到对应的损失函数里面除上10000。
+   训练过程中的损失值会保存在logs文件夹下的loss_%Y_%m_%d_%H_%M_%S文件夹中
+
+4、调参是一门蛮重要的学问，没有什么参数是一定好的，现有的参数是我测试过可以正常训练的参数，因此我会建议用现有的参数。
+   但是参数本身并不是绝对的，比如随着batch的增大学习率也可以增大，效果也会好一些；过深的网络不要用太大的学习率等等。
+   这些都是经验上，只能靠各位同学多查询资料和自己试试了。
+'''  
+if __name__ == "__main__":
+    #-------------------------------#
+    #   是否使用Cuda
+    #   没有GPU可以设置成False
+    #-------------------------------#
+    Cuda                = True
+    #--------------------------------------------------------#
+    #   设置训练集和测试集的JSON文件路径
+    #--------------------------------------------------------#
+    train_json_path = '/home/lhl/Git/datasets/EvDET200K/Event_Frame/annotations/train.json'
+    val_json_path   = '/home/lhl/Git/datasets/EvDET200K/Event_Frame/annotations/test.json'
+    image_root      = '/home/lhl/Git/datasets/EvDET200K/Event_Frame/data'  # 图像根目录
+    yolox_pretrained_path = '/home/lhl/Git/YOLOX-main/YOLOX_outputs/evdet200k100/yolox_base/epoch_83_ckpt.pth'
+    model_path      = ''
+    #------------------------------------------------------#
+    #   输入的shape大小，一定要是32的倍数
+    #------------------------------------------------------#
+    input_shape         = [640, 640]
+
+    #------------------------------------------------------------------#
+    #   YoloX的tricks应用
+    #   Cosine_scheduler 余弦退火学习率 True or False
+    #   由于数据增强已被移除，mosaic相关参数也一并删除
+    #------------------------------------------------------------------#
+    Cosine_scheduler    = True
+
+    Init_Epoch  = 0
+
+    End_Epoch   = 100
+    batch_size  = 4
+    lr          = 0.01 /64 *2
+    num_workers = 8
+
+    #----------------------------------------------------#
+    #   获取classes
+    #----------------------------------------------------#
+    num_classes = len(CLASS_NAMES)
+
+    #------------------------------------------------------#
+    #   创建yolo模型
+    #------------------------------------------------------#
+    model = YoloBodySST(num_classes,num_frame=3)
+
+    weights_init(model)
+
+    print(f'--> Loading pretrained YOLOX weights from: "{yolox_pretrained_path}"')
+    device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+
+    # 1. 加载预训练权重文件
+    try:
+        pretrained_state_dict = torch.load(yolox_pretrained_path, map_location=device)
+    except Exception as e:
+        print(f"Error loading weight file: {e}")
+
+    # 2. 如果是 checkpoint 文件，提取核心的 state_dict
+    if 'model' in pretrained_state_dict:
+        pretrained_state_dict = pretrained_state_dict['model']
+        print("    Checkpoint file detected. Extracted 'model' state_dict.")
+    elif 'state_dict' in pretrained_state_dict:
+        pretrained_state_dict = pretrained_state_dict['state_dict']
+        print("    Checkpoint file detected. Extracted 'state_dict'.")
+
+    # 3. 获取当前模型的 state_dict
+    model_state_dict = model.state_dict()
+    
+    # 4. 筛选出可以成功加载的权重
+    #    - 键名必须同时存在于预训练权重和当前模型中
+    #    - 两个权重张量的形状必须完全一致
+    load_dict = {
+        k: v for k, v in pretrained_state_dict.items()
+        if k in model_state_dict and model_state_dict[k].shape == v.shape
+    }
+
+    # 5. 打印加载信息
+    model_keys = set(model_state_dict.keys())
+    pretrained_keys = set(pretrained_state_dict.keys())
+    loaded_keys = set(load_dict.keys())
+
+    # 在新模型中但未被加载的键 (通常是新添加的模块)
+    unloaded_keys = model_keys - loaded_keys
+    
+    print(f"    {len(loaded_keys)} out of {len(model_keys)} layers were successfully matched and prepared for loading.")
+    
+    if unloaded_keys:
+        print(f"    The following {len(unloaded_keys)} layers were NOT found in the pretrained weights and will be trained from scratch:")
+        # 只打印前5个作为示例
+        for key in sorted(list(unloaded_keys))[:5]:
+            print(f"      - {key}")
+        if len(unloaded_keys) > 5:
+            print("      - ... (and more)")
+
+    # 6. 更新并加载权重
+    model_state_dict.update(load_dict)
+    model.load_state_dict(model_state_dict)
+
+
+
+    if model_path != '':
+        print('Load weights {}.'.format(model_path))
+        device          = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+        model_dict      = model.state_dict()
+        pretrained_dict = torch.load(model_path, map_location = device)
+        pretrained_dict = {k: v for k, v in pretrained_dict.items() if np.shape(model_dict[k]) == np.shape(v)}
+        model_dict.update(pretrained_dict)
+        model.load_state_dict(model_dict)
+
+    model_train = model.train()
+    if Cuda:
+        model_train = torch.nn.DataParallel(model)
+        cudnn.benchmark = True
+        model_train = model_train.cuda()
+
+    yolo_loss    = YOLOLoss(num_classes,strides=[8, 16, 32])
+    loss_history = LossHistory("log_frames/")
+    #===========================================================
+   #eval
+    print("Loading validation dataset for evaluation...")
+    EVAL_DATASET_ROOT_DIR = "/home/lhl/Git/datasets/EvDET200K" # 确保路径正确
+    SEQ_LEN = 3
+    EVAL_BATCH_SIZE = 4 # 你可以为验证设置一个单独的 batch_size
+    
+    val_dataset = Evdet200kCocoDataset(
+        EVAL_DATASET_ROOT_DIR, 
+        split="test", 
+        seq_len=SEQ_LEN
+    )
+    val_dataloader = DataLoader(
+        val_dataset, 
+        batch_size=EVAL_BATCH_SIZE, 
+        shuffle=False, 
+        num_workers=4, 
+        pin_memory=True, 
+        collate_fn=letterbox_collate_fn
+    )
+    coco_gt = val_dataset.coco # <-- 这就是你的 coco_gt
+    print("Validation dataset loaded.")
+    #===========================================================
+    #开始训练
+    start_epoch = 0
+    end_epoch   = 200
+    warmup_epochs=1
+    # --- 修改这里：使用简化版的EventJsonDataset ---
+    train_dataset   = EventJsonDataset(
+        json_path=train_json_path,
+        image_root=image_root,
+        input_shape=input_shape,
+        num_classes=num_classes
+    )
+
+    
+    gen         = DataLoader(train_dataset, shuffle = True, batch_size = batch_size, num_workers = num_workers, pin_memory=True,
+                                drop_last=True, collate_fn=yolo_dataset_collate)
+
+
+    num_train = len(train_dataset)
+    epoch_step      = num_train // batch_size
+    optimizer = optim.SGD(model_train.parameters(), lr=lr, momentum=0.9, weight_decay=5e-4)
+    # optimizer       = optim.Adam(model_train.parameters(), lr, weight_decay = 5e-4)
+
+
+
+    if Cosine_scheduler:
+        lr_scheduler = optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=end_epoch*epoch_step, eta_min=1e-5)
+    else:
+        lr_scheduler = optim.lr_scheduler.StepLR(optimizer, step_size=1, gamma=0.92)
+
+
+    # 2. 创建一个确定的虚拟输入
+    model.eval()
+    print("[验证步骤 2] 正在创建用于对比的虚拟输入数据...")
+    # 使用 torch.ones 确保每次运行的输入都完全相同
+    dummy_sequence_input = torch.ones(1, 3, 3, *input_shape).to(device)
+    
+    # 3. 执行前向传播
+    print("[验证步骤 3] 正在执行 YoloBodySST 的前向传播...")
+    with torch.no_grad():
+        output_sequence = model(dummy_sequence_input)
+    
+    # 4. 打印输出的一部分用于手动对比
+    print("\n[验证步骤 4] 打印输出的一部分用于手动对比:")
+    print("这是 YoloBodySST 输出的 P3 特征图 (第一个尺度) 的左上角 2x2 的值:")
+    # 我们打印第一个批次, 第一个通道, H和W的前2个元素
+    print(output_sequence[0][0, 0, :3, :3])
+    
+    print("\n" + "="*30 + " 验证结束，程序将退出。 " + "="*30) 
+
+    # print(val_dataset[0])  # 打印第一个样本的信息，确保数据加载正常
+
+    # --- [NEW] EMA 初始化 ---
+    # 使用官方 YOLOX 的衰减率 0.9998
+    ema_model = ModelEMA(model_train, 0.9998)
+    ema_model.updates = epoch_step * start_epoch # 如果从 0 开始, updates = 0
+
+    for epoch in range(start_epoch, end_epoch):
+        fit_one_epoch(model_train, model, yolo_loss, optimizer, epoch, 
+                epoch_step, gen, end_epoch, Cuda,ema_model,warmup_epochs=warmup_epochs,lr_scheduler=lr_scheduler,Cosine_scheduler=Cosine_scheduler)
+
+        if epoch % 2 == 0 :
+            print('Start Validation')
+            model_to_eval = ema_model.ema.eval()
+            # 确定用于评估的模型 (model_train 是你的训练模型)
+            # 如果你使用了 EMA (Exponential Moving Average)，你应该评估 EMA 模型
+            # model_to_eval = model.eval() 
+            device          = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+            # 调用导入的评估函数
+            # 注意: val_dataloader 和 coco_gt 是你在第 2 步中创建的
+            coco_evaluator = get_coco_map(
+               model=model_to_eval,
+               dataloader=val_dataloader,
+               coco_gt=coco_gt, # <--- 使用从第 2 步传入的真实 coco_gt
+               device=device,
+               # 你可以根据需要调整这里的参数
+               confidence=0.01,
+               nms_iou=0.65 
+            )
+            
+            # 提取并打印 mAP 结果
+            val_map = 0.0
+            if coco_evaluator:
+               print("\n" + "="*35 + " COCO EVALUATION SUMMARY " + "="*35)
+               coco_evaluator.summarize()
+               
+               # (可选，但推荐) 打印逐类结果
+               print_per_class_results(coco_evaluator, CLASS_NAMES)
+               
+               # 提取关键指标: AP @[ IoU=0.50:0.95 | area=all | maxDets=100 ]
+               val_map = coco_evaluator.stats[0] 
+               print(f"\nReturned mAP @[IoU=0.50:0.95]: {val_map:.4f}")
+            
+            print('Finish Validation')
+            if ema_model:
+                save_model_state = ema_model.ema.state_dict()
+                print("Saving EMA model in train...")
+            else:
+                save_model_state = model.state_dict()
+                print("Saving raw model in train (EMA not enabled)...")
+            torch.save(save_model_state, 'logs/ep%03d-map50_95%.4f.pth' % (epoch + 1, val_map))
+         
+
+
+            
