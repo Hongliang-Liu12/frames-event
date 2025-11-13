@@ -11,7 +11,7 @@ from tqdm import tqdm
 from nets.yolo_frames_net import YoloBodySST
 from pycocotools.coco import COCO
 from pycocotools.cocoeval import COCOeval
-
+from loguru import logger # [!!] 导入 logger
 def postprocess(prediction, num_classes, conf_thre=0.7, nms_thre=0.45, class_agnostic=False):
     # ... (此函数保持不变)
     box_corner = prediction.new(prediction.shape)
@@ -51,7 +51,7 @@ CLASS_NAMES = [
 ]
 
 class Evdet200kCocoDataset(CocoDetection):
-    def __init__(self, root_dir, split="test", seq_len=3):
+    def __init__(self, root_dir, split="train", seq_len=3):
         annotation_path = os.path.join(root_dir, "Event_Frame", "annotations", f"{split}.json")
         images_root = os.path.join(root_dir, "Event_Frame", "data")
         super().__init__(root=images_root, annFile=annotation_path)
@@ -61,7 +61,7 @@ class Evdet200kCocoDataset(CocoDetection):
 
         self.seq_len = seq_len
         
-        print(f"Building sequences for {split} set (seq_len={self.seq_len})...")
+        logger.info(f"Building sequences for {split} set (seq_len={self.seq_len})...")
         groups = {}
         # Use the original loader to get all image IDs
         for img_id in self.original_coco_loader.getImgIds():
@@ -89,10 +89,10 @@ class Evdet200kCocoDataset(CocoDetection):
         original_id_count = len(self.original_coco_loader.getImgIds())
         # self.ids will become the list of valid TARGET frame IDs
         self.ids = [img_id for img_id in self.original_coco_loader.getImgIds() if img_id in self.id_to_sequence]
-        print(f"Filtered {original_id_count} -> {len(self.ids)} valid target frames.")
+        logger.info(f"Filtered {original_id_count} -> {len(self.ids)} valid target frames.")
         
         # <--- 新增开始: 创建一个只包含有效目标帧的 coco_gt 对象 ---
-        print("Creating a filtered COCO ground truth object for evaluation...")
+        logger.info("Creating a filtered COCO ground truth object for evaluation...")
         
         # 1. 创建一个新的、空的 COCO 对象
         filtered_coco = COCO()
@@ -114,7 +114,7 @@ class Evdet200kCocoDataset(CocoDetection):
         # 6. 用这个新的、经过筛选的 coco 对象替换掉原来的
         # This is now the filtered GT object for evaluation
         self.coco = filtered_coco
-        print("Filtered COCO ground truth object created successfully.")
+        logger.info("Filtered COCO ground truth object created successfully.")
         # <--- 新增结束 ---
 
     def __getitem__(self, index):
@@ -134,7 +134,7 @@ class Evdet200kCocoDataset(CocoDetection):
             image_np = cv2.imread(image_path)
             
             if image_np is None:
-                print(f"Warning: Could not read image {image_path}. Using black frame.")
+                logger.info(f"Warning: Could not read image {image_path}. Using black frame.")
                 h = target_img_info.get('height', 640)
                 w = target_img_info.get('width', 640)
                 image_np = np.zeros((h, w, 3), dtype=np.uint8)
@@ -146,19 +146,19 @@ def letterbox_collate_fn(batch):
     images_seqs, targets, img_infos = zip(*batch)
     processed_seqs, ratios = [], []
     input_size = (640, 640)
-    
+
     for seq in images_seqs:
         processed_frames = []
         for i, img in enumerate(seq):
             img_h, img_w = img.shape[:2]
             scale = min(input_size[0] / img_h, input_size[1] / img_w)
-            
+
             if i == len(seq) - 1:
                 ratios.append(scale)
-            
+
             new_w, new_h = int(img_w * scale), int(img_h * scale)
             resized_img = cv2.resize(img, (new_w, new_h), interpolation=cv2.INTER_LINEAR)
-            
+
             padded_img = np.full((input_size[0], input_size[1], 3), 114, dtype=np.uint8)
             padded_img[0:new_h, 0:new_w] = resized_img
             padded_img = padded_img.transpose((2, 0, 1))
@@ -178,9 +178,9 @@ def print_per_class_results(coco_eval, class_names):
     id_to_name = {cat['id']: cat['name'] for cat in coco_eval.cocoGt.loadCats(cat_ids)}
     
     results_data = []
-    print("\n" + "="*50)
-    print(f"{'CLASS':<20} | {'AP @[.5:.95]':^20}")
-    print("-" * 50)
+    logger.info("\n" + "="*50)
+    logger.info(f"{'CLASS':<20} | {'AP @[.5:.95]':^20}")
+    logger.info("-" * 50)
     for k_idx, cat_id in enumerate(cat_ids):
         # areaRng = 'all', maxDets = 100
         p = precisions[:, :, k_idx, 0, 2]
@@ -188,8 +188,8 @@ def print_per_class_results(coco_eval, class_names):
         ap = np.mean(p) * 100.0 if p.size > 0 else float('nan')
         results_data.append((id_to_name.get(cat_id, "unknown"), ap))
         ap_str = f"{ap:.3f}" if not np.isnan(ap) else "---"
-        print(f"{id_to_name.get(cat_id, 'unknown'):<20} | {ap_str:^20}")
-    print("=" * 50)
+        logger.info(f"{id_to_name.get(cat_id, 'unknown'):<20} | {ap_str:^20}")
+    logger.info("=" * 50)
 
 def get_coco_map(model, dataloader, coco_gt, device, confidence=0.01, nms_iou=0.65):
     model.eval()
@@ -199,7 +199,7 @@ def get_coco_map(model, dataloader, coco_gt, device, confidence=0.01, nms_iou=0.
     strides = [8,16,32]
     hw = [(int(input_shape[0] / s), int(input_shape[1] / s)) for s in strides]
     
-    print("Starting evaluation...")
+    logger.info("Starting evaluation...")
     for images, _, img_infos, ratios in tqdm(dataloader, desc="Evaluating"):
         images = images.to(device)
         with torch.no_grad():
@@ -217,41 +217,41 @@ def get_coco_map(model, dataloader, coco_gt, device, confidence=0.01, nms_iou=0.
             decoded_outputs = torch.cat([(outputs[..., 0:2] + grids) * strides_tensor, torch.exp(outputs[..., 2:4]) * strides_tensor, outputs[..., 4:]], dim=-1)
             final_outputs = postprocess(decoded_outputs, num_classes, confidence, nms_iou)
 
-        for batch_idx, output_per_image in enumerate(final_outputs):
-            if output_per_image is not None:
-                final_outputs_cpu = output_per_image.cpu().numpy()
-                top_label = final_outputs_cpu[:, 6].astype('int32')
-                top_conf = final_outputs_cpu[:, 4] * final_outputs_cpu[:, 5]
-                top_boxes = final_outputs_cpu[:, :4]
-                
-                ratio = ratios[batch_idx]
-                h, w = img_infos[batch_idx]['height'], img_infos[batch_idx]['width']
-                
-                top_boxes /= ratio
-                top_boxes[:, [0, 2]] = np.clip(top_boxes[:, [0, 2]], 0, w)
-                top_boxes[:, [1, 3]] = np.clip(top_boxes[:, [1, 3]], 0, h)
-                
-                for i, c in enumerate(top_label):
-                    predicted_class_id = coco_gt.getCatIds(catNms=[CLASS_NAMES[c]])[0]
-                    box, score = top_boxes[i], float(top_conf[i])
-                    x1, y1, x2, y2 = box
-                    coco_bbox = [float(x1), float(y1), float(x2 - x1), float(y2 - y1)]
-                    results.append({
-                        "image_id": img_infos[batch_idx]['id'],
-                        "category_id": predicted_class_id,
-                        "bbox": coco_bbox,
-                        "score": score
-                    })
+            for batch_idx, output_per_image in enumerate(final_outputs):
+                if output_per_image is not None:
+                    final_outputs_cpu = output_per_image.cpu().numpy()
+                    top_label = final_outputs_cpu[:, 6].astype('int32')
+                    top_conf = final_outputs_cpu[:, 4] * final_outputs_cpu[:, 5]
+                    top_boxes = final_outputs_cpu[:, :4]
+
+                    ratio = ratios[batch_idx]
+                    h, w = img_infos[batch_idx]['height'], img_infos[batch_idx]['width']
+
+                    top_boxes /= ratio
+                    top_boxes[:, [0, 2]] = np.clip(top_boxes[:, [0, 2]], 0, w)
+                    top_boxes[:, [1, 3]] = np.clip(top_boxes[:, [1, 3]], 0, h)
+
+                    for i, c in enumerate(top_label):
+                        predicted_class_id = coco_gt.getCatIds(catNms=[CLASS_NAMES[c]])[0]
+                        box, score = top_boxes[i], float(top_conf[i])
+                        x1, y1, x2, y2 = box
+                        coco_bbox = [float(x1), float(y1), float(x2 - x1), float(y2 - y1)]
+                        results.append({
+                            "image_id": img_infos[batch_idx]['id'],
+                            "category_id": predicted_class_id,
+                            "bbox": coco_bbox,
+                            "score": score
+                        })
 
     # 验证ID匹配情况（现在应该匹配了）
     gt_img_ids = set(coco_gt.getImgIds())
     dt_img_ids = set([res["image_id"] for res in results]) if results else set()
-    print(f"\nGround Truth image IDs: {len(gt_img_ids)}")
-    print(f"Detection image IDs: {len(dt_img_ids)}")
-    print(f"IDs in GT but not in DT: {len(gt_img_ids - dt_img_ids)}") # 应该为0或非常小
+    logger.info(f"\nGround Truth image IDs: {len(gt_img_ids)}")
+    logger.info(f"Detection image IDs: {len(dt_img_ids)}")
+    logger.info(f"IDs in GT but not in DT: {len(gt_img_ids - dt_img_ids)}") # 应该为0或非常小
 
     if not results:
-        print("No detections were made. Cannot evaluate.")
+        logger.info("No detections were made. Cannot evaluate.")
         return None
 
     coco_dt = coco_gt.loadRes(results)
@@ -263,7 +263,7 @@ def get_coco_map(model, dataloader, coco_gt, device, confidence=0.01, nms_iou=0.
 
 if __name__ == "__main__":
     DATASET_ROOT_DIR = "/home/lhl/Git/datasets/EvDET200K"
-    MODEL_PATH = "/home/lhl/Git/frames-event/logs/twostage/startmap0.505-0.793/ep013-map50_95-0.5042.pth"
+    MODEL_PATH = "/home/lhl/Git/frames-event/logs/newtwostage/only2_perfect_resume/42_7_0.0002_0.00015_4_model_B_EMA_ep010_map-0.5260.pth"
     BATCH_SIZE = 4
     CONFIDENCE = 0.01
     NMS_IOU = 0.65
@@ -271,24 +271,53 @@ if __name__ == "__main__":
     SEQ_LEN = 3
 
     device = torch.device('cuda' if CUDA and torch.cuda.is_available() else 'cpu')
-    print("Loading dataset...")
+    logger.info("Loading dataset...")
     val_dataset = Evdet200kCocoDataset(DATASET_ROOT_DIR, split="test", seq_len=SEQ_LEN)
     val_dataloader = DataLoader(val_dataset, batch_size=BATCH_SIZE, shuffle=False, num_workers=4, pin_memory=True, collate_fn=letterbox_collate_fn)
     coco_gt = val_dataset.coco
 
 # -------------------- [ 从这里开始替换 ] --------------------
-    print(f"Loading model from {MODEL_PATH}...")
-    checkpoint = torch.load(MODEL_PATH, map_location=device)
+    logger.info(f"Loading model from {MODEL_PATH}...")
+    # Robust checkpoint loader: try normal torch.load first, then
+    # fall back to a safe unpickler that ignores missing mmengine
+    # classes so we can still extract tensors/state_dicts.
+    try:
+        checkpoint = torch.load(MODEL_PATH, map_location=device)
+    except ModuleNotFoundError as e:
+        msg = str(e)
+        if 'mmengine' in msg:
+            logger.warning("torch.load failed due to missing 'mmengine' during unpickle. Trying safe fallback to ignore mmengine objects and extract state_dict...")
+            import pickle, io, types
+
+            def _safe_loads(b):
+                # Custom Unpickler that returns simple placeholders for mmengine classes
+                class SafeUnpickler(pickle.Unpickler):
+                    def find_class(self, module, name):
+                        if module.startswith('mmengine'):
+                            # return a harmless placeholder (a simple function that does nothing)
+                            return lambda *args, **kwargs: None
+                        return super().find_class(module, name)
+
+                return SafeUnpickler(io.BytesIO(b)).load()
+
+            fake_pickle = types.SimpleNamespace(loads=_safe_loads)
+            try:
+                checkpoint = torch.load(MODEL_PATH, map_location=device, pickle_module=fake_pickle)
+            except Exception:
+                logger.exception("Safe fallback failed. Cannot load checkpoint.")
+                raise
+        else:
+            raise
     
     model = YoloBodySST(num_classes=len(CLASS_NAMES), phi='s', num_frame=SEQ_LEN) # 确保phi参数与训练时一致
 
     # 1. (可选, 但推荐) 检查权重是否被包裹
     if 'model' in checkpoint:
         checkpoint = checkpoint['model']
-        print("   Checkpoint file detected. Extracted 'model' state_dict.")
+        logger.info("   Checkpoint file detected. Extracted 'model' state_dict.")
     elif 'state_dict' in checkpoint:
         checkpoint = checkpoint['state_dict']
-        print("   Checkpoint file detected. Extracted 'state_dict'.")
+        logger.info("   Checkpoint file detected. Extracted 'state_dict'.")
 
     # 2. 获取新模型的 state_dict
     model_state_dict = model.state_dict()
@@ -305,25 +334,25 @@ if __name__ == "__main__":
     loaded_keys = set(load_dict.keys())
     unloaded_keys = model_keys - loaded_keys
     
-    print(f"   {len(loaded_keys)} out of {len(model_keys)} layers were successfully matched for loading.")
+    logger.info(f"   {len(loaded_keys)} out of {len(model_keys)} layers were successfully matched for loading.")
     if unloaded_keys:
-        print(f"   Warning: {len(unloaded_keys)} keys in the model were NOT found in the checkpoint:")
+        logger.info(f"   Warning: {len(unloaded_keys)} keys in the model were NOT found in the checkpoint:")
         for key in sorted(list(unloaded_keys))[:5]:
-             print(f"     - {key}")
-        if len(unloaded_keys) > 5: print("     - ... (and more)")
+             logger.info(f"     - {key}")
+        if len(unloaded_keys) > 5: logger.info("     - ... (and more)")
 
     # 5. 更新并加载过滤后的 state_dict
     model_state_dict.update(load_dict)
     model.load_state_dict(model_state_dict)
     
     model = model.to(device)
-    print("Model loaded.")
+    logger.info("Model loaded.")
     # -------------------- [ 到这里结束替换 ] --------------------
-    print("Model loaded.")
-    print("--- 训练后的融合门 (Fusion Gate) ---")
-    print(f"P3 Gate: {model.fusion_gate_p3.item()}")
-    print(f"P4 Gate: {model.fusion_gate_p4.item()}")
-    print(f"P5 Gate: {model.fusion_gate_p5.item()}")
+    logger.info("Model loaded.")
+    logger.info("--- 训练后的融合门 (Fusion Gate) ---")
+    logger.info(f"C3 Gate: {model.fusion_gate_c3.item()}")
+    logger.info(f"C4 Gate: {model.fusion_gate_c4.item()}")
+    logger.info(f"C5 Gate: {model.fusion_gate_c5.item()}")
     coco_evaluator = get_coco_map(
         model=model,
         dataloader=val_dataloader,
@@ -334,9 +363,9 @@ if __name__ == "__main__":
     )
 
     if coco_evaluator:
-        print("\n" + "="*35 + " COCO EVALUATION SUMMARY " + "="*35)
+        logger.info("\n" + "="*35 + " COCO EVALUATION SUMMARY " + "="*35)
         coco_evaluator.summarize()
         print_per_class_results(coco_evaluator, CLASS_NAMES)
         map_50_95 = coco_evaluator.stats[0]
-        print(f"\nReturned mAP @[IoU=0.50:0.95]: {map_50_95:.4f}")
+        logger.info(f"\nReturned mAP @[IoU=0.50:0.95]: {map_50_95:.4f}")
 

@@ -17,75 +17,43 @@ except ImportError:
     from nets.yolo import YOLOXHead
     from nets.darknet import CSPDarknet, BaseConv, CSPLayer, DWConv
 
-# --- 2. [!! 新增推荐 !!] 更强的时序颈 (EnhancedTemporalNeck) ---
-class EnhancedTemporalNeck(nn.Module):
+
+class SimpleTemporalNeck(nn.Module):
     """
-    一个更强大的时序 Neck。它明确地对 "运动" (通过特征差值) 和 
-    "上下文" (通过参考帧) 进行建模，并使用门控机制进行融合。
-    
-    它仍然只处理参考帧 (ref_frames) 和关键帧 (key_frame)，
-    但它返回的是一个更丰富的、代表“变化”的时序特征。
+    这个Neck只处理参考帧 (ref_frames)。
+    它的职责是 "从过去的帧中，我学到了什么？"
+    它 *绝对不会* 接触到 key_frame。
     """
     def __init__(self, in_channels, num_frame=3, act="silu"):
         super().__init__()
-        n_ref = num_frame - 1  # (num_frame - 1) 个参考帧
+        n_ref = num_frame - 1  # 我们只关心 (num_frame - 1) 个参考帧
         
-        # 1. 运动分支 (Motion Branch) - 学习 "发生了什么变化"
-        # 我们通过计算 (key_frame - ref_frame) 的差值来显式捕获运动
-        self.conv_motion = nn.Sequential(
+        # 1x1 卷积压缩，3x3 卷积学习局部
+        self.conv_temporal = nn.Sequential(
             BaseConv(in_channels * n_ref, in_channels, 1, 1, act=act),
             BaseConv(in_channels, in_channels, 3, 1, act=act)
         )
-        
-        # 2. 上下文分支 (Context Branch) - 学习 "背景是什么"
-        # 类似于 SimpleTemporalNeck，从参考帧中学习
-        self.conv_context = nn.Sequential(
-            BaseConv(in_channels * n_ref, in_channels, 1, 1, act=act),
-            BaseConv(in_channels, in_channels, 3, 1, act=act)
-        )
-        
-        # 3. 门控机制 (Gating Mechanism)
-        # 我们用 "上下文" 来决定 "运动" 的哪些部分是重要的
-        self.gate = nn.Sequential(
-            BaseConv(in_channels, in_channels // 4, 1, 1, act=act),
-            nn.Conv2d(in_channels // 4, in_channels, 1, 1, 0),
-            nn.Sigmoid()
-        )
-        
-        # 4. 最终融合
-        self.conv_final = BaseConv(in_channels, in_channels, 1, 1, act=act)
 
     def forward(self, feats):
-        # feats 列表: [frame1_feat, frame2_feat, ..., key_frame_feat]
-        key_frame = feats[-1]
+        # feats 列表: [frame1_feat, frame2_feat, key_frame_feat]
+        
+        # [!! 核心 !!] 我们只取参考帧
         ref_frames = feats[:-1]
         
+        # 如果没有参考帧 (例如 num_frame=1), 返回空值或0
         if not ref_frames:
-            return torch.zeros_like(key_frame) 
+            # 这种情况在你的 num_frame=3 时不会发生
+            # 但作为健壮性设计
+            return torch.zeros_like(feats[0]) 
 
-        # --- 1. 运动分支 ---
-        # 计算所有参考帧与关键帧的差值
-        diff_feats = [key_frame - ref for ref in ref_frames]
-        diff_cat = torch.cat(diff_feats, dim=1)
-        motion_feat = self.conv_motion(diff_cat) # [B, C, H, W]
+        r_feat_cat = torch.cat(ref_frames, dim=1)
+        
+        # 学习一个“时序上下文特征”并返回
+        temporal_context = self.conv_temporal(r_feat_cat)
+        return temporal_context
 
-        # --- 2. 上下文分支 ---
-        ref_cat = torch.cat(ref_frames, dim=1)
-        context_feat = self.conv_context(ref_cat) # [B, C, H, W]
-        
-        # --- 3. 门控融合 ---
-        # "背景" 决定 "运动" 的重要性
-        g = self.gate(context_feat)
-        gated_motion_feat = motion_feat * g
-        
-        # --- 4. 最终输出 ---
-        # 我们返回门控后的运动特征，作为“时序上下文”
-        final_temporal_feat = self.conv_final(gated_motion_feat)
-        
-        return final_temporal_feat
-
-# --- 2.5 (备选) 您的时序融合颈 (Motion_coupling_Neck) ---
-# (这部分无需修改，保持原样，您可以选择使用这个或 EnhancedTemporalNeck)
+# --- 2. 您的时序融合颈 (Motion_coupling_Neck) ---
+# (这部分无需修改，保持原样)
 class Motion_coupling_Neck(nn.Module):
     def __init__(self, in_channels, num_frame=3, act="silu"):
         super().__init__()
@@ -118,62 +86,36 @@ class Motion_coupling_Neck(nn.Module):
     def forward(self, feats):
         key_frame = feats[-1]
         ref_frames = feats[:-1]
-        
-        if not ref_frames:
-            # 增加健壮性，如果只有一个帧
-            r_feat_cat = torch.zeros_like(key_frame) 
-            if self.num_frame > 1:
-                # 预期有 n_ref 帧，但只得到 0 帧
-                # 我们需要创建一个 (B, C*n_ref, H, W) 的零张量
-                n_ref = self.num_frame - 1
-                bs, c, h, w = key_frame.shape
-                r_feat_cat = torch.zeros(bs, c * n_ref, h, w, 
-                                         device=key_frame.device, 
-                                         dtype=key_frame.dtype)
-            else:
-                # num_frame = 1, 本就不该调用
-                return key_frame # 或者返回 0
-        else:
-            r_feat_cat = torch.cat(ref_frames, dim=1)
-
+        r_feat_cat = torch.cat(ref_frames, dim=1)
         r_feat = self.conv_ref(r_feat_cat)
         c_feat = self.conv_cur(r_feat * key_frame)
         c_feat = self.conv_cr_mix(torch.cat([c_feat, key_frame], dim=1))
-        
         r_feats_list = []
-        
-        # 修正：确保在 ref_frames 为空时不会出错
-        if ref_frames:
-            for i in range(len(ref_frames)): # 使用 len(ref_frames) 替代 self.num_frame - 1
-                fused_ref_key = torch.cat([ref_frames[i], key_frame], dim=1)
-                weighted_feat = self.conv_gl(fused_ref_key) * self.weight[i]
-                r_feats_list.append(weighted_feat)
-        
-        if not r_feats_list:
-            # 如果没有参考帧，r_feats_sum 应该为 0
-            bs, c, h, w = c_feat.shape
-            r_feats_sum = torch.zeros(bs, c, h, w, 
-                                      device=c_feat.device, 
-                                      dtype=c_feat.dtype)
-        else:
-            r_feats_sum = torch.sum(torch.stack(r_feats_list, dim=0), dim=0)
-
+        for i in range(self.num_frame - 1):
+            fused_ref_key = torch.cat([ref_frames[i], key_frame], dim=1)
+            weighted_feat = self.conv_gl(fused_ref_key) * self.weight[i]
+            r_feats_list.append(weighted_feat)
+        r_feats_sum = torch.sum(torch.stack(r_feats_list, dim=0), dim=0)
         r_feat_gl = self.conv_gl_mix(r_feats_sum)
         final_fused_feat = self.conv_final(torch.cat([r_feat_gl, c_feat], dim=1))
         return final_fused_feat
 
 
 # --- 3. [!! 关键修正 !!] 内置的纯粹 YOLOX PAFPN 模块 ---
-# (这部分无需修改，保持原样)
+# 这个类是您 nets/yolo.py 中 YOLOPAFPN 的“精确副本”（只删除了 backbone）
 class _BuiltIn_YOLOPAFPN(nn.Module):
     def __init__(self, depth = 1.0, width = 1.0, in_features = ("dark3", "dark4", "dark5"), in_channels = [256, 512, 1024], depthwise = False, act = "silu"):
         super().__init__()
-        Conv = DWConv if depthwise else BaseConv
+        Conv                 = DWConv if depthwise else BaseConv
         
-        self.in_features = in_features
-        self.upsample = nn.Upsample(scale_factor=2, mode="nearest")
+        # [!! 关键删除 !!] 
+        # self.backbone     = CSPDarknet(depth, width, depthwise = depthwise, act = act)
+        
+        self.in_features    = in_features # 保留这个，即使没用到，以防万一
+        self.upsample       = nn.Upsample(scale_factor=2, mode="nearest")
 
-        self.lateral_conv0 = BaseConv(int(in_channels[2] * width), int(in_channels[1] * width), 1, 1, act=act)
+        # --- 所有层定义与您的 nets/yolo.py 完全一致 ---
+        self.lateral_conv0  = BaseConv(int(in_channels[2] * width), int(in_channels[1] * width), 1, 1, act=act)
         self.C3_p4 = CSPLayer(
             int(2 * in_channels[1] * width),
             int(in_channels[1] * width),
@@ -182,7 +124,7 @@ class _BuiltIn_YOLOPAFPN(nn.Module):
             depthwise = depthwise,
             act = act,
         )  
-        self.reduce_conv1 = BaseConv(int(in_channels[1] * width), int(in_channels[0] * width), 1, 1, act=act)
+        self.reduce_conv1   = BaseConv(int(in_channels[1] * width), int(in_channels[0] * width), 1, 1, act=act)
         self.C3_p3 = CSPLayer(
             int(2 * in_channels[0] * width),
             int(in_channels[0] * width),
@@ -191,7 +133,7 @@ class _BuiltIn_YOLOPAFPN(nn.Module):
             depthwise = depthwise,
             act = act,
         )
-        self.bu_conv2 = Conv(int(in_channels[0] * width), int(in_channels[0] * width), 3, 2, act=act)
+        self.bu_conv2       = Conv(int(in_channels[0] * width), int(in_channels[0] * width), 3, 2, act=act)
         self.C3_n3 = CSPLayer(
             int(2 * in_channels[0] * width),
             int(in_channels[1] * width),
@@ -200,7 +142,7 @@ class _BuiltIn_YOLOPAFPN(nn.Module):
             depthwise = depthwise,
             act = act,
         )
-        self.bu_conv1 = Conv(int(in_channels[1] * width), int(in_channels[1] * width), 3, 2, act=act)
+        self.bu_conv1       = Conv(int(in_channels[1] * width), int(in_channels[1] * width), 3, 2, act=act)
         self.C3_n4 = CSPLayer(
             int(2 * in_channels[1] * width),
             int(in_channels[2] * width),
@@ -211,31 +153,40 @@ class _BuiltIn_YOLOPAFPN(nn.Module):
         )
 
     def forward(self, input):
+        # [!! 关键修改 !!]
         # 'input' 是 YoloBodySST 传来的 (c3, c4, c5) 特征元组
+        
+        # [!! 关键删除 !!]
+        # out_features          = self.backbone.forward(input)
+        # [feat1, feat2, feat3] = [out_features[f] for f in self.in_features]
+        
+        # [!! 关键修改 !!]
+        # (feat1, feat2, feat3) 对应 (C3, C4, C5)
         feat1, feat2, feat3 = input
 
-        P5 = self.lateral_conv0(feat3)
+        # --- FPN 和 PAN 的剩余逻辑与您的 nets/yolo.py 完全一致 ---
+        P5            = self.lateral_conv0(feat3)
         P5_upsample = self.upsample(P5)
         P5_upsample = torch.cat([P5_upsample, feat2], 1)
         P5_upsample = self.C3_p4(P5_upsample)
 
-        P4 = self.reduce_conv1(P5_upsample) 
+        P4            = self.reduce_conv1(P5_upsample) 
         P4_upsample = self.upsample(P4) 
         P4_upsample = torch.cat([P4_upsample, feat1], 1) 
-        P3_out = self.C3_p3(P4_upsample)  
+        P3_out      = self.C3_p3(P4_upsample)  
 
-        P3_downsample = self.bu_conv2(P3_out) 
-        P3_downsample = torch.cat([P3_downsample, P4], 1) 
-        P4_out = self.C3_n3(P3_downsample) 
+        P3_downsample   = self.bu_conv2(P3_out) 
+        P3_downsample   = torch.cat([P3_downsample, P4], 1) 
+        P4_out          = self.C3_n3(P3_downsample) 
 
-        P4_downsample = self.bu_conv1(P4_out)
-        P4_downsample = torch.cat([P4_downsample, P5], 1)
-        P5_out = self.C3_n4(P4_downsample)
+        P4_downsample   = self.bu_conv1(P4_out)
+        P4_downsample   = torch.cat([P4_downsample, P5], 1)
+        P5_out          = self.C3_n4(P4_downsample)
 
         return (P3_out, P4_out, P5_out)
 
 
-# --- 4. [!! 最终版 !!] YoloBodySST (V3 增强融合版) ---
+# --- 4. [!! 最终版 !!] YoloBodySST (V2 高效版) ---
 class YoloBodySST(nn.Module):
     def __init__(self, num_classes, phi='s', num_frame=3):
         super().__init__()
@@ -248,7 +199,7 @@ class YoloBodySST(nn.Module):
         act = "silu"
         in_channels_config = [256, 512, 1024]
         
-        # --- 架构拆分 ---
+        # --- 架构拆分 (V2 核心) ---
         # 1. 骨干网络 (Backbone)
         self.backbone = CSPDarknet(depth, width, depthwise=depthwise, act=act)
         
@@ -257,41 +208,34 @@ class YoloBodySST(nn.Module):
         c4_channels = int(in_channels_config[1] * width)
         c5_channels = int(in_channels_config[2] * width)
 
-        # [!! 关键替换 !!] 使用我们新的 EnhancedTemporalNeck
-        self.neck_c3 = EnhancedTemporalNeck(in_channels=c3_channels, num_frame=num_frame, act=act)
-        self.neck_c4 = EnhancedTemporalNeck(in_channels=c4_channels, num_frame=num_frame, act=act)
-        self.neck_c5 = EnhancedTemporalNeck(in_channels=c5_channels, num_frame=num_frame, act=act)
-        
-        # (备选方案：您也可以换回您自己的 Motion_coupling_Neck)
         # self.neck_c3 = Motion_coupling_Neck(in_channels=c3_channels, num_frame=num_frame, act=act)
         # self.neck_c4 = Motion_coupling_Neck(in_channels=c4_channels, num_frame=num_frame, act=act)
         # self.neck_c5 = Motion_coupling_Neck(in_channels=c5_channels, num_frame=num_frame, act=act)
-        
-        # (原来的 SimpleTemporalNeck)
-        # self.neck_c3 = SimpleTemporalNeck(in_channels=c3_channels, num_frame=num_frame, act=act)
-        # self.neck_c4 = SimpleTemporalNeck(in_channels=c4_channels, num_frame=num_frame, act=act)
-        # self.neck_c5 = SimpleTemporalNeck(in_channels=c5_channels, num_frame=num_frame, act=act)
+
+        self.neck_c3 = SimpleTemporalNeck(in_channels=c3_channels, num_frame=num_frame, act=act)
+        self.neck_c4 = SimpleTemporalNeck(in_channels=c4_channels, num_frame=num_frame, act=act)
+        self.neck_c5 = SimpleTemporalNeck(in_channels=c5_channels, num_frame=num_frame, act=act)
 
 
-        # 3. 空间注意力模块 (Spatial Attention Module)
-        # 它的作用是告诉我们 "在哪里" 融合时序特征
+        # 3. 融合门 (Gating Mechanism)
+        self.fusion_gate_c3 = nn.Parameter(torch.tensor([0.0]), requires_grad=True)
+        self.fusion_gate_c4 = nn.Parameter(torch.tensor([0.0]), requires_grad=True)
+        self.fusion_gate_c5 = nn.Parameter(torch.tensor([0.0]), requires_grad=True)
+
         self.attention_map_c3 = self.create_attention_map(c3_channels, act)
         self.attention_map_c4 = self.create_attention_map(c4_channels, act)
         self.attention_map_c5 = self.create_attention_map(c5_channels, act)
 
-        # 4. 融合门 (Gating Mechanism)
-        # 它的作用是告诉我们 "融合多少" 时序特征
-        self.fusion_gate_c3 = nn.Parameter(torch.tensor([0.0]), requires_grad=True)
-        self.fusion_gate_c4 = nn.Parameter(torch.tensor([0.0]), requires_grad=True)
-        self.fusion_gate_c5 = nn.Parameter(torch.tensor([0.00]), requires_grad=True)
-
-        # 5. 特征金字塔 (FPN)
+        # 4. 特征金字塔 (FPN)
+        # [!! 关键 !!] 
+        # 使用我们在这个文件里复制和修改的 _BuiltIn_YOLOPAFPN
+        # 实例名 'fpn' 将 100% 匹配 "键名重命名" 逻辑
         self.fpn = _BuiltIn_YOLOPAFPN(depth, width, in_channels = in_channels_config, 
-                                        depthwise = depthwise, act = act)
+                                      depthwise = depthwise, act = act)
         
-        # 6. 检测头 (Head)
+        # 5. 检测头 (Head)
         self.head = YOLOXHead(num_classes, width, in_channels=in_channels_config, 
-                                depthwise=depthwise, act=act)
+                              depthwise=depthwise, act=act)
 
 
     def create_attention_map(self, in_channels, act):
@@ -302,15 +246,7 @@ class YoloBodySST(nn.Module):
                 nn.Sigmoid()
             )
 
-    # --- [!! 新增 !!] 组合注意力模块 ---
-    def create_combined_attention_map(self, in_channels, act):
-        # 输入是 [original_c*, fused_c*] 的拼接，维度 2*in_channels
-        return nn.Sequential(
-            BaseConv(in_channels, in_channels, 1, 1, act=act),
-            BaseConv(in_channels, in_channels // 4, 3, 1, act=act),
-            nn.Conv2d(in_channels // 4, 1, 1, 1, 0),
-            nn.Sigmoid()
-        )
+
     def forward(self, inputs):
         # inputs 维度: [bs, num_frame, c, h, w]
         
@@ -325,60 +261,49 @@ class YoloBodySST(nn.Module):
             c4_features.append(c4)
             c5_features.append(c5)
             
-        # --- 2. 时序融合 (获取时序特征) ---
-        # fused_c* 是 "学到的时序特征" (例如，运动特征)
-        # 维度: [B, C, H, W]
+        # --- 2. 时序融合 ---
         fused_c3 = self.neck_c3(c3_features)
         fused_c4 = self.neck_c4(c4_features)
         fused_c5 = self.neck_c5(c5_features)
         
-        # --- 3. 提取关键帧特征 ---
+        # --- 3. 门控残差连接 ---
         original_c3 = c3_features[-1]
         original_c4 = c4_features[-1]
         original_c5 = c5_features[-1]
 
 
-        # --- 4. [!! 关键修正 !!] 正确的门控融合逻辑 ---
-        
-        # 4a. 根据"时序特征"判断"在哪里"发生了运动
-        # attn_map_* 是 "空间注意力图"
-        # 维度: [B, 1, H, W]
-        attn_map_c3 = self.attention_map_c3(fused_c3) 
+        # --- 4. [!! 关键 !!] 生成空间注意力图 ---
+        # 根据"时序上下文"判断"在哪里"发生了运动
+        attn_map_c3 = self.attention_map_c3(fused_c3) # [B, 1, H, W]
         attn_map_c4 = self.attention_map_c4(fused_c4)
         attn_map_c5 = self.attention_map_c5(fused_c5)
 
-        # 4b. 将 "空间注意力" 应用于 "时序特征"
-        # 告诉模型只关注那些 "有运动发生的区域" 的 "运动特征"
-        # 维度: [B, C, H, W] * [B, 1, H, W] (广播) -> [B, C, H, W]
-        gated_fused_c3 = fused_c3 * attn_map_c3
-        gated_fused_c4 = fused_c4 * attn_map_c4
-        gated_fused_c5 = fused_c5 * attn_map_c5
-
-        # 4c. [!! 核心 !!] 
-        # 将 "门控后的时序特征" 通过 "可学习的融合门" 添加到 "原始关键帧"
-        # final = 关键帧 + (融合比例 * 门控时序特征)
-        # 这才是真正的特征融合
-        final_c3 = original_c3 + self.fusion_gate_c3 * gated_fused_c3
-        final_c4 = original_c4 + self.fusion_gate_c4 * gated_fused_c4
-        final_c5 = original_c5 + self.fusion_gate_c5 * gated_fused_c5
+        # # --- 5. 融合 ---
+        final_c3 = original_c3 + self.fusion_gate_c3 * attn_map_c3
+        final_c4 = original_c4 + self.fusion_gate_c4 * attn_map_c4
+        final_c5 = original_c5 + self.fusion_gate_c5 * attn_map_c5
+        # final_c3 = original_c3
+        # final_c4 = original_c4
+        # final_c5 = original_c5       
 
 
-        # with TCE
-        #final_c3 = original_c3 +  gated_fused_c3
-        #final_c4 = original_c4 +  gated_fused_c4
-        #final_c5 = original_c5 +  gated_fused_c5
-        #final_c3 = original_c3
-        #final_c4 = original_c4
-        #final_c5 = original_c5
-        # (比较一下您原来的错误逻辑)
-        # final_c3 = original_c3 + self.fusion_gate_c3 * attn_map_c3 
-        # (这是将 [B,C,H,W] 与 [B,1,H,W] 相加，时序信息丢失)
+        # gated_fused_c3 = fused_c3 * attn_map_c3
+        # gated_fused_c4 = fused_c4 * attn_map_c4
+        # gated_fused_c5 = fused_c5 * attn_map_c5
 
-        # --- 5. 运行 FPN (仅一次) ---
+        # final_c3 = original_c3 + self.fusion_gate_c3 * gated_fused_c3
+        # final_c4 = original_c4 + self.fusion_gate_c4 * gated_fused_c4
+        # final_c5 = original_c5 + self.fusion_gate_c5 * gated_fused_c5
+        # # # final_c3 = original_c3
+        # # # final_c4 = original_c4
+        # # # final_c5 = original_c5   
+
+
+        # --- 4. 运行 FPN (仅一次) ---
         fpn_inputs = (final_c3, final_c4, final_c5)
-        p3, p4, p5 = self.fpn(fpn_inputs) 
+        p3, p4, p5 = self.fpn(fpn_inputs) # [!! 现在可以正常工作 !!]
 
-        # --- 6. 运行 Head (仅一次) ---
+        # --- 5. 运行 Head (仅一次) ---
         final_features = (p3, p4, p5)
         outputs = self.head(final_features)
         
@@ -388,10 +313,8 @@ class YoloBodySST(nn.Module):
 #                       测试代码
 # ==================================================== #
 if __name__ == "__main__":
-    print("--- (V3 增强融合版) 正在运行 YoloBodySST 模型完整性检查 ---")
-    print("--- 1. FPN 已内置。")
-    print("--- 2. 已修正 YoloBodySST.forward 融合逻辑。")
-    print("--- 3. 已替换为 EnhancedTemporalNeck。")
+    print("--- (最终修正版) 正在运行 YoloBodySST (V2 高效版) 模型完整性检查 ---")
+    print("--- FPN 已内置 (使用 nets/yolo.py 的精确副本)，nets/yolo.py 未被修改 ---")
 
     num_classes = 10
     phi = 's'

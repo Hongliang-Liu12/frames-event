@@ -42,9 +42,11 @@ if __name__ == "__main__":
     # yolox_pretrained_path = '/home/lhl/Git/YOLOX-main/YOLOX_outputs/evdet200k100/yolox_base/epoch_83_ckpt.pth'
     # yolox_pretrained_path = '/home/lhl/Git/frames-event/logs/ep005-map50_950.5124.pth'
     # yolox_pretrained_path = '/home/lhl/Git/frames-event/logs/ep003-map50_950.4975.pth'
-    # yolox_pretrained_path='/home/lhl/Git/frames-event/logs/twostage/startmap0.505-0.793/ep013-map50_95-0.5042.pth'
+    # yolox_pretrained_path=''
     yolox_pretrained_path=''
-    model_path      = ''
+    # model_path      = '/home/lhl/Git/frames-event/logs/newtwostage/startmap0.505-0.793/ep001-map50_95-0.5143.pth'
+    # model_path = '/home/lhl/Git/frames-event/logs/newtwostage/startmap0.505-0.793/2.ep011-map50_95-0.5248.pth'
+    model_path = ''
     #------------------------------------------------------#
     #   输入的shape大小，一定要是32的倍数
     #------------------------------------------------------#
@@ -60,8 +62,8 @@ if __name__ == "__main__":
     Init_Epoch  = 0
 
     End_Epoch   = 100
-    batch_size  = 4
-    lr          = 0.01 /64 *2
+    batch_size  = 8
+    lr          = 0.01 /64 
     num_workers = 8
 
     #----------------------------------------------------#
@@ -93,87 +95,92 @@ if __name__ == "__main__":
             pretrained_state_dict = torch.load(yolox_pretrained_path, map_location=device)
         except Exception as e:
             print(f"Error loading weight file: {e}")
-            pretrained_state_dict = None
+            pretrained_state_dict = None # 确保后续代码不会崩溃
 
         if pretrained_state_dict:
-            # 2. 如果是 checkpoint 文件，提取核心的 state_dict
-            if 'model' in pretrained_state_dict:
+            # 2. 智能提取 state_dict
+            if 'ema' in pretrained_state_dict:
+                print("    Checkpoint file detected. Found 'ema' state_dict, using it.")
+                pretrained_state_dict = pretrained_state_dict['ema']
+            elif 'model' in pretrained_state_dict:
+                print("    Checkpoint file detected. 'ema' not found, using 'model' state_dict.")
                 pretrained_state_dict = pretrained_state_dict['model']
-                print("    Checkpoint file detected. Extracted 'model' state_dict.")
             elif 'state_dict' in pretrained_state_dict:
+                print("    Checkpoint file detected. Found 'state_dict'.")
                 pretrained_state_dict = pretrained_state_dict['state_dict']
-                print("    Checkpoint file detected. Extracted 'state_dict'.")
+            else:
+                print("    No 'ema', 'model', or 'state_dict' key found. Assuming raw state_dict.")
 
-            # 3. 获取当前模型的 state_dict
+            # --- 3. [!! 最终的键名重命名逻辑 !!] ---
+            # 基于您的调试输出：
+            # .pth 权重文件只有 'backbone' 和 'head' 两个顶层键
+            
+            print("    正在重命名预训练权重键名以匹配新架构...")
+            massaged_state_dict = {}
+            for k_pre, v_pre in pretrained_state_dict.items():
+                new_key = None
+                
+                if k_pre.startswith('head.'):
+                    # 规则 1: 'head.cls_preds...' -> 'head.cls_preds...'
+                    # (Head 保持不变)
+                    new_key = k_pre
+                    
+                elif k_pre.startswith('backbone.backbone.'):
+                    # 规则 2: 'backbone.backbone.stem...' -> 'backbone.stem...'
+                    # (将 V1 的 Backbone 键名 映射到 V2 的 Backbone 键名)
+                    new_key = k_pre.replace('backbone.backbone.', 'backbone.', 1)
+                    
+                elif k_pre.startswith('backbone.'):
+                    # 规则 3: 'backbone.C3_p4...' -> 'fpn.C3_p4...'
+                    # (将 V1 的 FPN 键名 映射到 V2 的 FPN 键名)
+                    # [!!] 这条规则必须在 "规则 2" 之后执行
+                    new_key = k_pre.replace('backbone.', 'fpn.', 1)
+                
+                if new_key:
+                    massaged_state_dict[new_key] = v_pre
+
+            print(f"    键名重命名完成。")
+            
+            # 4. 获取当前模型的 state_dict
             model_state_dict = model.state_dict()
             
-            # 4. [智能映射] 筛选并重命名权重
-            
-            # 官方YOLOX的FPN键
-            fpn_layer_prefixes = (
-                'lateral_conv0', 'C3_p4', 'reduce_conv1', 'C3_p3',
-                'bu_conv2', 'C3_n3', 'bu_conv1', 'C3_n4'
-            )
-            
-            load_dict = {}
-            print("    Mapping pretrained keys to new model structure...")
-            
-            for k, v in pretrained_state_dict.items():
-                new_k = None # 目标键名
-                
-                # 规则 1: 修复 'backbone.backbone.' -> 'backbone.'
-                if k.startswith('backbone.backbone.'):
-                    new_k = k.replace('backbone.backbone.', 'backbone.', 1)
-                
-                # 规则 2: 修复 'backbone.lateral...' -> 'fpn.lateral...'
-                elif k.startswith('backbone.') and any(k.startswith('backbone.' + p) for p in fpn_layer_prefixes):
-                    new_k = 'fpn.' + k.replace('backbone.', '', 1)
+            # 5. 使用 "massaged_state_dict" (重命名后的) 进行筛选
+            load_dict = {
+                k: v for k, v in massaged_state_dict.items()
+                if k in model_state_dict and model_state_dict[k].shape == v.shape
+            }
 
-                # 规则 3: 修复 'lateral...' -> 'fpn.lateral...' (官方权重)
-                elif k.startswith(fpn_layer_prefixes):
-                    new_k = 'fpn.' + k
+            # 6. 打印加载信息 (这部分不变)
+            model_keys_set = set(model_state_dict.keys())
+            loaded_keys_set = set(load_dict.keys())
+            unloaded_keys_set = model_keys_set - loaded_keys_set
 
-                # 规则 4: 保留 'backbone.stem...' 和 'head.stems...' (官方/标准权重)
-                elif k.startswith('backbone.') or k.startswith('head.'):
-                    new_k = k
-                
-                # 现在，使用你的简单逻辑来检查映射后的键
-                if new_k in model_state_dict:
-                    if model_state_dict[new_k].shape == v.shape:
-                        load_dict[new_k] = v
-                    else:
-                        print(f"  [跳过] 形状不匹配: {k} (预训练) -> {new_k} (当前)")
-                # else:
-                    # 打印未被加载的键 (调试用)
-                    # if new_k:
-                    #     print(f"  [跳过] 键不匹配: {k} (预训练) -> {new_k} (未在当前模型中找到)")
-
-            # 5. 打印加载信息 (你原来的代码)
-            model_keys = set(model_state_dict.keys())
-            loaded_keys = set(load_dict.keys())
-            unloaded_keys = model_keys - loaded_keys
+            print(f"    {len(loaded_keys_set)} out of {len(model_keys_set)} (总模型层数) layers were successfully matched.")
             
-            print(f"    {len(loaded_keys)} out of {len(model_keys)} layers were successfully matched and prepared for loading.")
-            
-            if unloaded_keys:
-                print(f"    The following {len(unloaded_keys)} layers were NOT found in the pretrained weights or were mismatched, and will be trained from scratch:")
-                unloaded_prefixes = set()
-                for k in sorted(unloaded_keys):
-                    prefix = ".".join(k.split('.')[:2])
-                    unloaded_prefixes.add(prefix)
-                
-                for prefix in sorted(list(unloaded_prefixes)):
-                    if prefix.startswith("motion_neck") or prefix.startswith("fusion_gate"):
-                        print(f"      - {prefix}.* (新时序模块)")
-                    elif not (prefix.startswith("backbone") or prefix.startswith("head") or prefix.startswith("fpn")):
-                        print(f"      - {prefix}.*")
-            
-                # (调试用) 打印未加载的预训练层
-                if len(unloaded_keys) > (621-108): # 假设 108 是head, 621 是总数
-                    print("      - ... (以及未成功加载的 backbone/fpn 层)")
+            # 过滤掉我们 *期望* 未加载的新层
+            expected_unloaded_prefixes = ('neck_c', 'fusion_gate_c')
+            unexpected_unloaded_keys = []
+            expected_unloaded_keys = []
 
+            for key in unloaded_keys_set:
+                if key.startswith(expected_unloaded_prefixes):
+                    expected_unloaded_keys.append(key)
+                else:
+                    unexpected_unloaded_keys.append(key)
 
-            # 6. 更新并加载权重 (你原来的代码)
+            if expected_unloaded_keys:
+                print(f"    [信息] {len(expected_unloaded_keys)} 个新添加的层将从头训练 (这是正常的):")
+                for key in sorted(list(expected_unloaded_keys))[:3]:
+                    print(f"       - {key}")
+                if len(expected_unloaded_keys) > 3: print("       - ... (and more)")
+            
+            if unexpected_unloaded_keys:
+                print(f"    [!! 警告 !!] {len(unexpected_unloaded_keys)} 个 *非预期* 层未能加载 (这可能是个问题):")
+                for key in sorted(unexpected_unloaded_keys)[:3]:
+                    print(f"       - {key}")
+                if len(unexpected_unloaded_keys) > 3: print("       - ... (and more)")
+
+            # 7. 更新并加载权重
             model_state_dict.update(load_dict)
             model.load_state_dict(model_state_dict)
             print("    Weights loaded successfully.")
@@ -258,8 +265,59 @@ if __name__ == "__main__":
 
     num_train = len(train_dataset)
     epoch_step      = num_train // batch_size
-    optimizer = optim.SGD(model_train.parameters(), lr=lr, momentum=0.9, weight_decay=5e-4)
-    # optimizer       = optim.Adam(model_train.parameters(), lr, weight_decay = 5e-4)
+
+
+# ------------------------------------------------------------------ #
+    # [!! 最终修正版 !!] 优化器参数分组 (基于 named_parameters)
+    # 
+    # pg0: BatchNorm 权重 (不使用 weight decay)
+    # pg1: 其他所有权重 (使用 weight decay)
+    # pg2: 所有偏置 (Biases) 和 融合门 (Fusion Gates) (不使用 weight decay)
+    # ------------------------------------------------------------------ #
+    pg0, pg1, pg2 = [], [], []  # 优化器参数组
+    
+    print("Sorting parameters into optimizer groups...")
+    
+    # [!! 关键 !!] 我们遍历 .named_parameters() 而不是 .named_modules()
+    # 这样可以捕获所有参数，包括 fusion_gate
+    for k, v in model_train.named_parameters():
+        if not v.requires_grad:
+            continue  # 跳过在冻结阶段被冻结的参数
+
+        if k.endswith(".bias"):
+            # 规则 1: 所有偏置 (biases) -> pg2 (no decay)
+            pg2.append(v)
+        
+        elif "fusion_gate" in k:
+            # 规则 2: [!! 修正 !!] 捕获 'fusion_gate' 参数 -> pg2 (no decay)
+            pg2.append(v)
+
+        elif "bn" in k or k.endswith(".bn.weight"):
+            # 规则 3: BatchNorm 权重 -> pg0 (no decay)
+            pg0.append(v)
+        
+        else:
+            # 规则 4: 其他所有参数 (如 conv.weight) -> pg1 (with decay)
+            pg1.append(v)
+
+    # 打印分组结果，确保 fusion_gate (应有3个) 在 pg2 中
+    total_params = len(list(model_train.parameters()))
+    grouped_params = len(pg0) + len(pg1) + len(pg2)
+    print(f"Optimizer groups: {len(pg0)} (no-decay BN), {len(pg1)} (decay weights), {len(pg2)} (no-decay biases/gates)")
+    print(f"Total params: {total_params}, Grouped params: {grouped_params}")
+    if total_params != grouped_params:
+         print("[!! 警告 !!] 参数分组不匹配！请检查冻结逻辑。")
+
+
+    # 优化器定义保持不变 (使用这三组)
+    optimizer = optim.SGD([
+        {'params': pg0, 'weight_decay': 0.0},
+        {'params': pg1, 'weight_decay': 5e-4},
+        {'params': pg2, 'weight_decay': 0.0}
+    ], lr=lr, momentum=0.9)
+    # ------------------------------------------------------------------ #
+    # [!! 修正结束 !!]
+    # ------------------------------------------------------------------ #
 
 
 
@@ -378,7 +436,7 @@ if __name__ == "__main__":
     # 使用官方 YOLOX 的衰减率 0.9998
     ema_model = ModelEMA(model_train, 0.9998)
     ema_model.updates = epoch_step * start_epoch # 如果从 0 开始, updates = 0
-    if yolox_pretrained_path != '' and model_path != '':
+    if yolox_pretrained_path != '' or model_path != '':
         print('Start First Validation')
         model_to_eval = ema_model.ema.eval()
         # 确定用于评估的模型 (model_train 是你的训练模型)
@@ -388,9 +446,9 @@ if __name__ == "__main__":
         # 调用导入的评估函数
         # 注意: val_dataloader 和 coco_gt 是你在第 2 步中创建的
         print("--- 训练后的融合门 (Fusion Gate) ---")
-        print(f"P3 Gate: {model.fusion_gate_p3.item()}")
-        print(f"P4 Gate: {model.fusion_gate_p4.item()}")
-        print(f"P5 Gate: {model.fusion_gate_p5.item()}")
+        print(f"c3 Gate: {model.fusion_gate_c3.item()}")
+        print(f"c4 Gate: {model.fusion_gate_c4.item()}")
+        print(f"c5 Gate: {model.fusion_gate_c5.item()}")
         coco_evaluator = get_coco_map(
             model=model_to_eval,
             dataloader=val_dataloader,
@@ -428,7 +486,7 @@ if __name__ == "__main__":
         print(f"初始融合门 C4: {model.fusion_gate_c4.item()}")
         print(f"初始融合门 C5: {model.fusion_gate_c5.item()}")
         val_map = 0.0
-        if epoch % 5 == 0 :
+        if epoch % 2 == 0 :
             print('Start Validation')
             model_to_eval = ema_model.ema.eval()
             # 确定用于评估的模型 (model_train 是你的训练模型)

@@ -33,18 +33,35 @@ CLASS_NAMES = [
 
 if __name__ == "__main__":
     
-    # ----------------------------------------------------#
+# ----------------------------------------------------#
     #    [!! 1. 提前定义超参数 (用于文件名) !!]
+    #----------------------------------------------------#
+    #   两阶段训练超参数
+    #   1. Freeze_Epoch:  冻结训练阶段的epoch数
+    #   2. UnFreeze_Epoch: 解冻微调阶段的epoch数
+    #   总训练epoch = Freeze_Epoch + UnFreeze_Epoch
+    #----------------------------------------------------#
+   
+    #----------------------------------------------------#
+    #   学习率超参数
+    #   Freeze_Lr:   冻结阶段的学习率 (可以稍大)
+    #   UnFreeze_Lr: 解冻阶段的学习率 (必须很小)
+    #----------------------------------------------------#
     # ----------------------------------------------------#
     SEED = 42
     Freeze_Epoch        = 7
     UnFreeze_Epoch      = 30
-    Freeze_Lr           = 1e-4
-    UnFreeze_Lr         = 1e-4
+    Freeze_Lr           = 2e-4
+    UnFreeze_Lr         = 2e-4
+    
     # 定义日志目录
-    log_dir = "logs/newtwostage/new2"
+    log_dir = "logs/newtwostage/only2"
     os.makedirs(log_dir, exist_ok=True) # 确保这个目录存在
 
+    # ----------------------------------------------------#
+    #    [!! 2. Loguru 设置 !!]
+    # ----------------------------------------------------#
+    
     # A. 根据超参数创建文件名 "前缀"
     #    格式: 42_8_2e-4_2e-4
     file_prefix = f"{SEED}_{Freeze_Epoch}_{Freeze_Lr}_{UnFreeze_Lr}"
@@ -85,8 +102,14 @@ if __name__ == "__main__":
     torch.manual_seed(SEED)
     if torch.cuda.is_available():
         torch.cuda.manual_seed_all(SEED) # 为所有GPU设置种子
-
+    #-------------------------------#
+    #   是否使用Cuda
+    #   没有GPU可以设置成False
+    #-------------------------------#
     Cuda                = True
+    #--------------------------------------------------------#
+    #   [FIXED] 统一定义 device
+    #--------------------------------------------------------#
     device = torch.device('cuda' if torch.cuda.is_available() and Cuda else 'cpu')
     #--------------------------------------------------------#
     #   设置训练集和测试集和预训练权重路径
@@ -94,10 +117,12 @@ if __name__ == "__main__":
     train_json_path = '/home/lhl/Git/datasets/EvDET200K/Event_Frame/annotations/train.json'
     val_json_path   = '/home/lhl/Git/datasets/EvDET200K/Event_Frame/annotations/test.json'
     image_root      = '/home/lhl/Git/datasets/EvDET200K/Event_Frame/data'  # 图像根目录
-    yolox_pretrained_path ='/home/lhl/Git/YOLOX-main/YOLOX_outputs/evdet200k100/yolox_base/epoch_83_ckpt.pth'
-    # yolox_pretrained_path='/home/lhl/Git/mmdetection-3.3.0/work_dirs/yolox_s_8xb8-300e_evdet200k/epoch_58.pth'
-    # model_path      = '/home/lhl/Git/frames-event/logs/newtwostage/startmap0.505-0.793/ep007-map50_95-0.5214.pth'
-    model_path      = ''
+    # yolox_pretrained_path = '/home/lhl/Git/YOLOX-main/YOLOX_outputs/evdet200k100/yolox_base/epoch_30_ckpt.pth'
+    # yolox_pretrained_path = '/home/lhl/Git/frames-event/logs/model/ep005-loss2.690-0.511.pth'
+    # yolox_pretrained_path ='/home/lhl/Git/YOLOX-main/YOLOX_outputs/evdet200k100/yolox_base/epoch_83_ckpt.pth'
+    yolox_pretrained_path=''
+    model_path      = '/home/lhl/Git/frames-event/logs/newtwostage/startmap0.505-0.793/ep007-map50_95-0.4978.pth'
+    # model_path      = ''
 
     #------------------------------------------------------#
     #   输入的shape大小，一定要是32的倍数
@@ -108,6 +133,9 @@ if __name__ == "__main__":
     #   Cosine_scheduler 余弦退火学习率 True or False
     #------------------------------------------------------------------#
     Cosine_scheduler    = True
+
+
+
     batch_size   = 8
     #----------------------------------------------------#
     #进程数
@@ -117,6 +145,7 @@ if __name__ == "__main__":
     #   获取classes
     #----------------------------------------------------#
     num_classes = len(CLASS_NAMES)
+
     #===========================================================
     # eval: Setup validation dataloader (用于预训练评估和训练中评估)
     #===========================================================
@@ -303,11 +332,12 @@ if __name__ == "__main__":
         model_train = model_train.cuda()
 
     yolo_loss    = YOLOLoss(num_classes,strides=[8, 16, 32])
+    loss_history = LossHistory("log_frames/")
 
 #===========================================================
     # 开始训练
     #===========================================================
-    start_epoch = 0
+    start_epoch = 7
     end_epoch   = Freeze_Epoch + UnFreeze_Epoch
     warmup_epochs=1
     
@@ -317,7 +347,8 @@ if __name__ == "__main__":
         input_shape=input_shape,
         num_classes=num_classes
     )
-    gen = DataLoader(train_dataset, shuffle=True, batch_size = batch_size, num_workers = num_workers, pin_memory=True,
+
+    gen = DataLoader(train_dataset, shuffle = True, batch_size = batch_size, num_workers = num_workers, pin_memory=True,
                                      drop_last=True, collate_fn=yolo_dataset_collate)
     
     num_train = len(train_dataset)
@@ -336,11 +367,9 @@ if __name__ == "__main__":
     val_map = 0.0 # 在循环前初始化
 
     for epoch in range(start_epoch, end_epoch):
-        epoch_seed = SEED + epoch  # <--- [!!] 就是这行代码 [!!]
-        random.seed(epoch_seed)
-        np.random.seed(epoch_seed)
-        torch.manual_seed(epoch_seed)
+        
         # --- 阶段切换逻辑 (仅在 epoch 0 和 epoch Freeze_Epoch 时执行) ---
+        
         if epoch == 0 or epoch == Freeze_Epoch:
             
             # --- [!! 关键 !!] 定义参数分组的函数 ---
@@ -525,31 +554,14 @@ if __name__ == "__main__":
         # --- [!! 日志重命名逻辑结束 !!] ---
 
 
-# --- [!! 升级 !!] 保存 "Model (A)" 和 "EMA (B)" ---
-        logger.info("Saving models for epoch %03d with mAP: %.4f" % (epoch + 1, val_map))
-
-        # [!!] 1. 创建包含所有超参数的文件名前缀
-        # 格式: SEED=42_Freeze=7_Unfreeze=30
-        file_prefix = f"{SEED}_{Freeze_Epoch}_{Freeze_Lr}_{UnFreeze_Lr}"
-
-        # 2. 保存 "Model (A)" (即 'model', 无 .module)
-        # 这是 "有噪声" 的训练中模型
-        model_A_state = model.state_dict()
-        
-        # 新文件名格式: SEED=..._model_A_ep=007_map-0.4978.pth
-        save_A_path = os.path.join(log_dir, f"{file_prefix}_ep{epoch + 1:03d}_model_map-{val_map:.4f}.pth")
-        
-        torch.save(model_A_state, save_A_path)
-        logger.info(f"      'Model (A)' saved to: {save_A_path}")
-
-        # 3. 保存 "EMA (B)" (即 ema_model.ema)
-        # 这是 "平滑" 的评估模型
+        # --- [FIXED] 将保存逻辑移到评估块内部 ---
         if ema_model:
-            model_B_state = ema_model.ema.state_dict()
-            
-            # 新文件名格式: SEED=..._model_B_EMA_ep=007_map-0.4978.pth
-            save_B_path = os.path.join(log_dir, f"{file_prefix}_ep{epoch + 1:03d}_model_EMA_map-{val_map:.4f}.pth")
-            
-            torch.save(model_B_state, save_B_path)
-            logger.info(f"      'Model (B) EMA' saved to: {save_B_path}")
+            save_model_state = ema_model.ema.state_dict()
+            logger.info("Saving EMA model in train...epoch:%03d"% (epoch+1)) # <-- [修改]
+        else:
+            save_model_state = model.state_dict()
+            logger.info("Saving raw model in train (EMA not enabled)...") # <-- [修改]
+        logger.info("Saving model for epoch %03d with mAP: %.4f" % (epoch + 1, val_map))
+        torch.save(save_model_state, 'logs/newtwostage/only2/ep%03d-map50_95-%.4f.pth' % (epoch + 1, val_map))
+        logger.info("saved to: logs/newtwostage/only2/ep%03d-map50_95-%.4f.pth" % (epoch + 1, val_map))
         # --- 保存逻辑结束 ---

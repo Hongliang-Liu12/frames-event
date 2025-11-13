@@ -37,12 +37,12 @@ if __name__ == "__main__":
     #    [!! 1. 提前定义超参数 (用于文件名) !!]
     # ----------------------------------------------------#
     SEED = 42
-    Freeze_Epoch        = 7
+    Freeze_Epoch        = 12
     UnFreeze_Epoch      = 30
     Freeze_Lr           = 1e-4
     UnFreeze_Lr         = 1e-4
     # 定义日志目录
-    log_dir = "logs/newtwostage/new2"
+    log_dir = "logs/newtwostage/all2newstart1"
     os.makedirs(log_dir, exist_ok=True) # 确保这个目录存在
 
     # A. 根据超参数创建文件名 "前缀"
@@ -94,8 +94,8 @@ if __name__ == "__main__":
     train_json_path = '/home/lhl/Git/datasets/EvDET200K/Event_Frame/annotations/train.json'
     val_json_path   = '/home/lhl/Git/datasets/EvDET200K/Event_Frame/annotations/test.json'
     image_root      = '/home/lhl/Git/datasets/EvDET200K/Event_Frame/data'  # 图像根目录
-    yolox_pretrained_path ='/home/lhl/Git/YOLOX-main/YOLOX_outputs/evdet200k100/yolox_base/epoch_83_ckpt.pth'
-    # yolox_pretrained_path='/home/lhl/Git/mmdetection-3.3.0/work_dirs/yolox_s_8xb8-300e_evdet200k/epoch_58.pth'
+    # yolox_pretrained_path ='/home/lhl/Git/YOLOX-main/YOLOX_outputs/evdet200k100/yolox_base/epoch_83_ckpt.pth'
+    yolox_pretrained_path='/home/lhl/Git/mmdetection-3.3.0/work_dirs/yolox_s_8xb8-300e_evdet200k/epoch_58.pth'
     # model_path      = '/home/lhl/Git/frames-event/logs/newtwostage/startmap0.505-0.793/ep007-map50_95-0.5214.pth'
     model_path      = ''
 
