@@ -74,7 +74,7 @@ if __name__ == "__main__":
     
     # [!! 修改 3 !!] 
     # 建议为这个 "完美续训" 实验使用一个新目录
-    log_dir = "logs/newtwostage/only2_perfect_resume" 
+    log_dir = "logs/newtwostage/only2_perfect_resumeq" 
     os.makedirs(log_dir, exist_ok=True) 
 
     # ----------------------------------------------------#

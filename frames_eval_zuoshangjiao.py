@@ -12,7 +12,6 @@ from nets.yolo_frames_net import YoloBodySST
 from pycocotools.coco import COCO
 from pycocotools.cocoeval import COCOeval
 from loguru import logger # [!!] 导入 logger
-
 def postprocess(prediction, num_classes, conf_thre=0.7, nms_thre=0.45, class_agnostic=False):
     # ... (此函数保持不变)
     box_corner = prediction.new(prediction.shape)
@@ -143,11 +142,9 @@ class Evdet200kCocoDataset(CocoDetection):
 
         return image_seq_np, target, target_img_info
 
-# -------------------- [ 修改开始: letterbox_collate_fn ] --------------------
 def letterbox_collate_fn(batch):
     images_seqs, targets, img_infos = zip(*batch)
-    # --- [ 修改：增加 paddings 列表 ] ---
-    processed_seqs, ratios, paddings = [], [], []
+    processed_seqs, ratios = [], []
     input_size = (640, 640)
 
     for seq in images_seqs:
@@ -156,33 +153,21 @@ def letterbox_collate_fn(batch):
             img_h, img_w = img.shape[:2]
             scale = min(input_size[0] / img_h, input_size[1] / img_w)
 
+            if i == len(seq) - 1:
+                ratios.append(scale)
+
             new_w, new_h = int(img_w * scale), int(img_h * scale)
             resized_img = cv2.resize(img, (new_w, new_h), interpolation=cv2.INTER_LINEAR)
 
             padded_img = np.full((input_size[0], input_size[1], 3), 114, dtype=np.uint8)
-            
-            # --- [ 新增：计算居中所需的 padding ] ---
-            pad_top = (input_size[0] - new_h) // 2
-            pad_left = (input_size[1] - new_w) // 2
-
-            # --- [ 修改：将图像放置在计算好的居中位置 ] ---
-            padded_img[pad_top : pad_top + new_h, pad_left : pad_left + new_w] = resized_img
-            
-            # --- [ 修改：将 ratio 和 padding 的保存移到此处 ] ---
-            if i == len(seq) - 1:
-                # 仅保存最后一个（目标）帧的 ratio 和 padding
-                ratios.append(scale)
-                paddings.append((pad_left, pad_top)) # <-- 保存 padding
-
+            padded_img[0:new_h, 0:new_w] = resized_img
             padded_img = padded_img.transpose((2, 0, 1))
             padded_img = np.ascontiguousarray(padded_img, dtype=np.float32)
             processed_frames.append(padded_img)
         processed_seqs.append(np.stack(processed_frames, axis=0))
 
     images_batch = torch.from_numpy(np.stack(processed_seqs, axis=0))
-    # --- [ 修改：返回 paddings ] ---
-    return images_batch, list(targets), list(img_infos), ratios, paddings
-# -------------------- [ 修改结束: letterbox_collate_fn ] --------------------
+    return images_batch, list(targets), list(img_infos), ratios
 
 def print_per_class_results(coco_eval, class_names):
     # ... (此函数保持不变)
@@ -206,7 +191,6 @@ def print_per_class_results(coco_eval, class_names):
         logger.info(f"{id_to_name.get(cat_id, 'unknown'):<20} | {ap_str:^20}")
     logger.info("=" * 50)
 
-# -------------------- [ 修改开始: get_coco_map ] --------------------
 def get_coco_map(model, dataloader, coco_gt, device, confidence=0.01, nms_iou=0.65):
     model.eval()
     num_classes = len(CLASS_NAMES)
@@ -216,8 +200,7 @@ def get_coco_map(model, dataloader, coco_gt, device, confidence=0.01, nms_iou=0.
     hw = [(int(input_shape[0] / s), int(input_shape[1] / s)) for s in strides]
     
     logger.info("Starting evaluation...")
-    # --- [ 修改：接收 letterbox_collate_fn 返回的 paddings ] ---
-    for images, _, img_infos, ratios, paddings in tqdm(dataloader, desc="Evaluating"):
+    for images, _, img_infos, ratios in tqdm(dataloader, desc="Evaluating"):
         images = images.to(device)
         with torch.no_grad():
             outputs = model(images)
@@ -241,22 +224,12 @@ def get_coco_map(model, dataloader, coco_gt, device, confidence=0.01, nms_iou=0.
                     top_conf = final_outputs_cpu[:, 4] * final_outputs_cpu[:, 5]
                     top_boxes = final_outputs_cpu[:, :4]
 
-                    # --- [ 修改：获取 padding 并应用正确的坐标逆变换 ] ---
                     ratio = ratios[batch_idx]
-                    pad_left, pad_top = paddings[batch_idx] # <-- 获取 padding
                     h, w = img_infos[batch_idx]['height'], img_infos[batch_idx]['width']
 
-                    # 1. 从 640x640 坐标系平移回 letterbox 内的坐标系 (减去 padding)
-                    top_boxes[:, [0, 2]] -= pad_left
-                    top_boxes[:, [1, 3]] -= pad_top
-                    
-                    # 2. 缩放回原始图像坐标系 (除以 ratio)
                     top_boxes /= ratio
-                    
-                    # 3. 裁剪到原始图像边界
                     top_boxes[:, [0, 2]] = np.clip(top_boxes[:, [0, 2]], 0, w)
                     top_boxes[:, [1, 3]] = np.clip(top_boxes[:, [1, 3]], 0, h)
-                    # --- [ 修改结束 ] ---
 
                     for i, c in enumerate(top_label):
                         predicted_class_id = coco_gt.getCatIds(catNms=[CLASS_NAMES[c]])[0]
@@ -287,8 +260,6 @@ def get_coco_map(model, dataloader, coco_gt, device, confidence=0.01, nms_iou=0.
     coco_eval.accumulate()
     
     return coco_eval
-# -------------------- [ 修改结束: get_coco_map ] --------------------
-
 
 if __name__ == "__main__":
     DATASET_ROOT_DIR = "/home/lhl/Git/datasets/EvDET200K"
@@ -302,12 +273,10 @@ if __name__ == "__main__":
     device = torch.device('cuda' if CUDA and torch.cuda.is_available() else 'cpu')
     logger.info("Loading dataset...")
     val_dataset = Evdet200kCocoDataset(DATASET_ROOT_DIR, split="test", seq_len=SEQ_LEN)
-    
-    # --- [ 注意：这里使用的 collate_fn 已经是我们修改后的 letterbox_collate_fn ] ---
     val_dataloader = DataLoader(val_dataset, batch_size=BATCH_SIZE, shuffle=False, num_workers=4, pin_memory=True, collate_fn=letterbox_collate_fn)
     coco_gt = val_dataset.coco
 
-# -------------------- [ 您的模型加载代码 (保持不变) ] --------------------
+# -------------------- [ 从这里开始替换 ] --------------------
     logger.info(f"Loading model from {MODEL_PATH}...")
     # Robust checkpoint loader: try normal torch.load first, then
     # fall back to a safe unpickler that ignores missing mmengine
@@ -354,7 +323,7 @@ if __name__ == "__main__":
     model_state_dict = model.state_dict()
     
     # 3. 过滤 checkpoint，只保留匹配的键
-    #     这就是能自动过滤掉 "total_ops" 的关键
+    #    这就是能自动过滤掉 "total_ops" 的关键
     load_dict = {
         k: v for k, v in checkpoint.items()
         if k in model_state_dict and model_state_dict[k].shape == v.shape
@@ -378,15 +347,12 @@ if __name__ == "__main__":
     
     model = model.to(device)
     logger.info("Model loaded.")
-# -------------------- [ 模型加载代码结束 ] --------------------
-    
+    # -------------------- [ 到这里结束替换 ] --------------------
     logger.info("Model loaded.")
     logger.info("--- 训练后的融合门 (Fusion Gate) ---")
     logger.info(f"C3 Gate: {model.fusion_gate_c3.item()}")
     logger.info(f"C4 Gate: {model.fusion_gate_c4.item()}")
     logger.info(f"C5 Gate: {model.fusion_gate_c5.item()}")
-    
-    # --- [ 注意：这里调用的 get_coco_map 已经是我们修改后的版本 ] ---
     coco_evaluator = get_coco_map(
         model=model,
         dataloader=val_dataloader,
@@ -402,3 +368,4 @@ if __name__ == "__main__":
         print_per_class_results(coco_evaluator, CLASS_NAMES)
         map_50_95 = coco_evaluator.stats[0]
         logger.info(f"\nReturned mAP @[IoU=0.50:0.95]: {map_50_95:.4f}")
+
